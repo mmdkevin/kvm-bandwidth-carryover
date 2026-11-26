@@ -1,10 +1,8 @@
 # KVM Bandwidth Carryover
 
-**v2.2.1 · AlmaLinux / Ubuntu**
+<p dir="rtl">مدیریت حجم باقی‌ماندهٔ مشتریان در <strong>Virtualizor KVM</strong>، بدون شارژ دوبارهٔ سهمیه پس از ریست مصرف.</p>
 
-<p dir="rtl">اسکریپتی برای مدیریت ماندهٔ ترافیک <strong>VPSهای KVM در پنل Virtualizor</strong>. بعد از ریست‌شدن مصرف، سقف ترافیک را به حجم باقی‌ماندهٔ مشتری تغییر می‌دهد تا سهمیهٔ کامل قبلی دوباره شارژ نشود.</p>
-
-A bandwidth carry-over tool for **KVM VPSs managed by Virtualizor**. After a usage reset, it replaces the traffic quota with the customer's remaining allowance instead of granting the full quota again.
+Keep customers' remaining traffic allowance after usage resets in **Virtualizor KVM**.
 
 [فارسی](#persian) | [English](#english)
 
@@ -16,19 +14,22 @@ A bandwidth carry-over tool for **KVM VPSs managed by Virtualizor**. After a usa
 
 ## فارسی
 
-### چطور کار می‌کند؟
+### این اسکریپت چه مشکلی را حل می‌کند؟
 
-مثلاً مشتری از **۵۰۰۰ گیگ، ۴۳۰۰ گیگ** مصرف کرده و **۷۰۰ گیگ** دارد. وقتی پنل مصرف را ریست کند، برنامه سقف را از ۵۰۰۰ به **۷۰۰ گیگ** تغییر می‌دهد. اگر بعد از ریست ۲۰ گیگ مصرف شده باشد، نتیجه **۲۰ از ۷۰۰ گیگ** است؛ یعنی ۶۸۰ گیگ باقی می‌ماند.
+اگر VPS را با حجم مشخص می‌فروشید، ریست دوره‌ای مصرف در Virtualizor می‌تواند دوباره کل سهمیه را در اختیار مشتری بگذارد. این اسکریپت بعد از تشخیص ریست، **سقف ترافیک را به حجم باقی‌ماندهٔ مشتری تغییر می‌دهد**.
 
-برنامه هر دقیقه مصرف پنل را با آخرین عدد ذخیره‌شده مقایسه می‌کند. **هر کاهش مصرف را ریست حساب می‌کند**؛ علت و تاریخ ریست را تشخیص نمی‌دهد. فقط سقف `Bandwidth` را تغییر می‌دهد؛ قطع یا تعلیق VPS به تنظیمات خود Virtualizor بستگی دارد.
+مثلاً مشتری از **۵۰۰۰ گیگ، ۴۳۰۰ گیگ** مصرف کرده است:
 
-### نصب و مدیریت
+| وضعیت | مصرف در پنل | سقف ترافیک | باقی‌مانده |
+|---|---:|---:|---:|
+| قبل از ریست | ۴۳۰۰ گیگ | ۵۰۰۰ گیگ | ۷۰۰ گیگ |
+| بعد از ریست و اصلاح اسکریپت | صفر | **۷۰۰ گیگ** | **۷۰۰ گیگ** |
 
-این نسخه برای **KVMهای محلی روی سرور Master با `serid=0`** نوشته شده؛ نودهای Slave را پوشش نمی‌دهد. محیط‌های هدف **AlmaLinux 9 و Ubuntu 22.04 / 24.04** هستند. Python 3.9+، PHP و SDK محلی Virtualizor و سرویس فعال Cron لازم‌اند.
+این روش برای فروش حجمی مناسب است که اعتبار آن باید تا زمان مصرف‌شدن باقی بماند.
 
-برنامه سرویس `cron` یا `crond` را خودکار تشخیص می‌دهد. اگر وابستگی‌ای کم باشد، دستور مناسب `apt-get` یا `dnf` را نشان می‌دهد؛ خودش بسته نصب نمی‌کند یا سرویس سیستم را روشن نمی‌کند. سازگاری با تست‌های شبیه‌سازی‌شده بررسی شده؛ اجرای کامل روی میزبان واقعی Ubuntu هنوز آزمایش نشده است.
+### نصب
 
-با کاربر `root` روی سرور اصلی اجرا کنید و گزینهٔ **۱ — Install / Upgrade** را بزنید:
+با کاربر `root` روی **سرور اصلی Virtualizor** اجرا کنید و گزینهٔ **۱ — Install / Upgrade** را بزنید:
 
 <div dir="ltr">
 
@@ -38,41 +39,26 @@ bash <(curl -fsSL https://raw.githubusercontent.com/mmdkevin/kvm-bandwidth-carry
 
 </div>
 
-نصب اول یا **نصب دوباره پس از حذف** فقط مصرف و سقف فعلی پنل را ثبت می‌کند؛ دادهٔ باقی‌مانده از نصب قدیمی ملاک نیست و سهمیه تغییر نمی‌کند. بررسی خودکار **هر دقیقه روشن است** و با بستن SSH متوقف نمی‌شود. اگر برنامه هنوز نصب باشد، گزینهٔ نصب/ارتقا، **ارتقا** محسوب می‌شود و سابقه و وضعیت زمان‌بندی را حفظ می‌کند.
+در شروع، حجم و مصرف فعلی ثبت می‌شود؛ بررسی خودکار **هر دقیقه** ادامه پیدا می‌کند، حتی بعد از بستن SSH. برای بازکردن منوی مدیریت بنویسید **`kvm-bw`**؛ مشاهدهٔ وضعیت، گزارش‌ها، توقف بررسی‌ها و حذف برنامه از همان منو انجام می‌شود.
 
-| دستور | کاربرد |
-|---|---|
-| `kvm-bw` | منوی نصب، مدیریت، لاگ، پشتیبان و حذف |
-| `kvm-bw status` | وضعیت بررسی خودکار و آخرین مانده‌های ذخیره‌شده |
-| `kvm-bw preview` | نمایش اصلاحات پیشنهادی، بدون تغییر اطلاعات |
-| `kvm-bw run` | یک بررسی واقعی؛ ممکن است سقف را تغییر دهد |
-| `kvm-bw start` / `kvm-bw stop` | روشن یا متوقف‌کردن بررسی خودکار |
-| `kvm-bw logs` / `kvm-bw doctor` | گزارش عملیات و بررسی سلامت برنامه |
-| `kvm-bw backup` / `kvm-bw upgrade` | پشتیبان‌گیری یا ارتقای برنامه |
-| `kvm-bw uninstall` | حذف کامل برنامه، کرون، سابقه، لاگ و پشتیبان‌های خودش |
-| `kvm-bw commands` | فهرست کامل دستورات |
+محیط‌های هدف: **AlmaLinux 9 و Ubuntu 22.04 / 24.04**، برای VPSهای KVM روی همان سرور اصلی؛ نودهای Slave پوشش داده نمی‌شوند. اجرای کامل روی میزبان واقعی Ubuntu هنوز آزمایش نشده است.
 
-### سؤال‌های مهم
+### قبل از استفاده بدانید
 
-- **برای مشتری حجم اضافه یا کم کنم؟** همان فیلد Bandwidth را ویرایش کنید؛ تغییر ۴۰۰۰ به ۵۳۰۰ یعنی ۱۳۰۰ گیگ افزایش. هنگام اصلاح در حالت `pending`، هم‌زمان سقف را تغییر ندهید.
-- **ریست دستی بزنم؟** خیر؛ آن هم ریست دوره‌ای حساب می‌شود. برای شارژ مشتری، سقف را افزایش دهید.
-- **VPS جدید اضافه می‌شود؟** بله؛ KVM محلی با سقف محدود و عدد صحیح، در بررسی موفق بعدی خودکار ثبت می‌شود. سقف صفر یعنی نامحدود و برای VPS جدید ثبت نمی‌شود.
-- **تیک Service period bandwidth calculation مهم است؟** هر دو حالت قابل‌استفاده‌اند؛ تشخیص با کاهش مصرف است. تغییر این تنظیم هم اگر مصرف را پایین بیاورد، ریست حساب می‌شود.
-- **وقتی حجم تمام شد چه می‌شود؟** برنامه خودش VPS را قطع نمی‌کند و `Bandwidth suspend` را روشن نمی‌کند. برای ماندهٔ زیر یک گیگ، پیش‌فرض سقف **یک گیگ** است و اختلاف برای محاسبهٔ بعد ذخیره می‌شود؛ پس قطع دقیق در اعتبار صفر ندارد. سقف صفر نمی‌نویسد، چون در پنل یعنی نامحدود.
+- **برای شارژ مشتری، فیلد Bandwidth را افزایش دهید؛ مصرف را دستی ریست نکنید.** اسکریپت هر کاهش مصرف را ریست حساب می‌کند.
+- VPSهای جدید با سهمیهٔ محدود، خودکار به بررسی‌ها اضافه می‌شوند.
+- اسکریپت فقط سقف ترافیک را تغییر می‌دهد؛ قطع یا تعلیق VPS به تنظیمات خود Virtualizor بستگی دارد. حداقل سقف پیش‌فرض یک گیگ است، پس قطع دقیق در اعتبار صفر ندارد.
+- دقت محاسبه به آمار پنل و فاصلهٔ بررسی‌ها وابسته است؛ بعضی ریست‌ها یا مصرف‌ها ممکن است دیده نشوند. مصرف ریست‌شدهٔ قبل از نصب بازیابی نمی‌شود.
 
-### نگهداری داده‌ها و حذف
+<details>
+<summary>ارتقا، حذف و نگهداری اطلاعات</summary>
 
-- **لاگ:** یک فایل فعال و حداکثر ۳ آرشیو، هرکدام تا ۵ مگابایت؛ مجموع تا ۲۰ مگابایت و حداکثر عمر ۷ روز. چرخش در شروع روز جدید یا پرشدن فایل انجام می‌شود.
-- **پشتیبان:** حداکثر ۵ فایل، با عمر حداکثر ۷ روز.
-- **دادهٔ مصرف:** آخرین وضعیت و یک نسخهٔ قبلی نگهداری می‌شود؛ برای هر دقیقه تاریخچه اضافه نمی‌شود. سابقهٔ VPSی که ۷ روز از اولین تشخیص غیبتش در فهرست محلی پنل گذشته باشد، در بررسی بعدی پاک می‌شود.
+- **ارتقا:** سابقهٔ فعال و تنظیم روشن یا خاموش بودن بررسی‌ها حفظ می‌شود.
+- **حذف:** برنامه، کرون، سابقه، لاگ و پشتیبان‌های خودش کامل پاک می‌شوند؛ سهمیه و مصرف داخل پنل تغییر نمی‌کند.
+- **نصب دوباره پس از حذف:** اعداد فعلی پنل مبنا می‌شوند؛ سابقهٔ نصب قبلی ملاک نیست.
+- **نگهداری فایل‌ها:** لاگ‌ها تا ۲۰ مگابایت و حداکثر ۷ روز؛ پشتیبان‌ها حداکثر ۵ فایل تا ۷ روز. سابقهٔ VPS حذف‌شده پس از ۷ روز از تشخیص غیبتش، در بررسی بعدی پاک می‌شود. پاک‌سازی همراه بررسی‌های برنامه انجام می‌شود.
 
-پاک‌سازی در بررسی‌های برنامه و هنگام نصب/ارتقا انجام می‌شود؛ هنگام توقف بررسی‌ها فایل جدیدی تولید نمی‌شود. **Uninstall همهٔ داده‌های خود برنامه را پاک می‌کند**؛ سقف و مصرف VPSها و کرون‌های Virtualizor تغییر نمی‌کنند. پشتیبانی که خودتان به محل دیگری کپی کرده‌اید، پاک نمی‌شود.
-
-### محدودیت‌های ضروری
-
-برنامه از آمار پنل استفاده می‌کند، نه شمارش مستقل ترافیک. تأخیر آمار یا ریستی که تا بررسی بعد مصرفش به عدد قبلی رسیده، ممکن است باعث جاافتادن مصرف یا ریست شود. ریست‌های قبل از نصب هم قابل بازیابی نیستند.
-
-**فایل `/var/lib/reset-carryover/state.json` را حذف نکنید**؛ سابقهٔ حسابداری در آن است. در صورت خطا، از `status`، `logs` و `doctor` شروع کنید. دستور `resync` اعداد فعلی پنل را مبنای جدید می‌کند و ماندهٔ کسری ذخیره‌شده را پاک می‌کند؛ ابزار برگرداندن حجم نیست.
+</details>
 
 </div>
 
@@ -82,56 +68,44 @@ bash <(curl -fsSL https://raw.githubusercontent.com/mmdkevin/kvm-bandwidth-carry
 
 ## English
 
-### How it works
+### What problem does it solve?
 
-A VPS has used **4,300 GB of 5,000 GB**, leaving **700 GB**. After Virtualizor resets usage, the tool replaces the quota with **700 GB**. If 20 GB has already been used since the reset, the result is **20 GB of 700 GB**, leaving 680 GB.
+When you sell a VPS with a fixed traffic allowance, a periodic Virtualizor usage reset can give the customer the full allowance again. This tool detects the reset and **replaces the quota with the customer's remaining traffic allowance**.
 
-It checks reported usage every minute. **Every observed decrease counts as a reset**, regardless of cause or date. It only edits the `Bandwidth` quota. VPS suspension and traffic enforcement remain Virtualizor settings.
+For example, a customer has used **4,300 GB of 5,000 GB**:
 
-### Installation and management
+| Stage | Panel usage | Traffic quota | Remaining |
+|---|---:|---:|---:|
+| Before the reset | 4,300 GB | 5,000 GB | 700 GB |
+| After the reset and correction | 0 GB | **700 GB** | **700 GB** |
 
-This release supports **local KVM guests on the Master host (`serid=0`)**, not Slave nodes. Target systems are **AlmaLinux 9 and Ubuntu 22.04 / 24.04**, requiring Python 3.9+, the local Virtualizor PHP/SDK installation, and an active Cron service.
+Use this approach for traffic packages that should remain available until consumed.
 
-The tool detects `cron` or `crond` and provides `apt-get` or `dnf` dependency instructions when needed. It does not install packages or start system services automatically. Compatibility has been checked with simulated tests; a full installation on a real Ubuntu Virtualizor host has not yet been tested.
+### Installation
 
-Run as `root` on the main host, then choose **1 — Install / Upgrade**:
+Run as `root` on the **main Virtualizor host**, then choose **1 — Install / Upgrade**:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/mmdkevin/kvm-bandwidth-carryover/main/install.sh)
 ```
 
-First installation or **reinstallation after removal** records current panel usage and quotas without editing them. Leftover accounting data from an older removal is ignored. Checks are **enabled every minute** and continue after SSH closes. If the application is still installed, Install / Upgrade is an **upgrade** and preserves accounting history and the enabled/paused schedule.
+The tool starts by recording current usage and quotas, then checks **every minute**, even after SSH closes. Run **`kvm-bw`** to open the menu for status, logs, pausing checks, and removal.
 
-| Command | Purpose |
-|---|---|
-| `kvm-bw` | Menu for installation, management, logs, backups, and removal |
-| `kvm-bw status` | Schedule status and last saved balances |
-| `kvm-bw preview` | Read-only preview of proposed corrections |
-| `kvm-bw run` | One real check; may edit quotas |
-| `kvm-bw start` / `kvm-bw stop` | Enable or pause automatic checks |
-| `kvm-bw logs` / `kvm-bw doctor` | Operation log and health checks |
-| `kvm-bw backup` / `kvm-bw upgrade` | Create a backup or upgrade |
-| `kvm-bw uninstall` | Remove the application, its Cron, accounting data, logs, and backups |
-| `kvm-bw commands` | Complete command reference |
+Target systems: **AlmaLinux 9 and Ubuntu 22.04 / 24.04**, managing KVM guests on the same main host. Slave nodes are not covered. A full installation on a real Ubuntu Virtualizor host has not yet been tested.
 
-### Common questions
+### Before you use it
 
-- **Can I add or remove traffic?** Edit Bandwidth normally. Changing 4,000 to 5,300 adds 1,300 GB. Avoid concurrent edits while a correction is `pending`.
-- **Can I reset usage manually?** No. Manual resets also trigger carry-over. Increase the quota to grant more traffic.
-- **Are new VPSs enrolled?** Yes, at a later successful check, for local KVM guests with a finite whole-GB quota. New guests with a zero/unlimited quota are skipped.
-- **Does Service period bandwidth calculation need to be enabled?** Either setting works. Detection uses a usage decrease; changing the setting can also trigger correction if usage drops.
-- **What happens when credit runs out?** The tool does not suspend VPSs or enable `Bandwidth suspend`. Below 1 GB, the default policy writes a **1 GB** quota and records the difference for later calculations. It is not a strict zero-credit cutoff. It never writes zero as depleted credit, because zero means unlimited in the panel.
+- **Add traffic by increasing Bandwidth; do not manually reset usage.** Every observed decrease in usage counts as a reset.
+- New VPSs with finite quotas are automatically included in future checks.
+- The tool only changes traffic quotas. Suspension and traffic enforcement depend on Virtualizor settings. The default minimum quota is 1 GB, so this is not a strict zero-credit cutoff.
+- Accuracy depends on panel statistics and the check interval; some resets or consumption may be missed. Usage reset before installation cannot be recovered.
 
-### Storage and removal
+<details>
+<summary>Upgrades, removal, and data retention</summary>
 
-- **Logs:** one active file plus up to 3 archives, each at most 5 MiB; up to 20 MiB total and a maximum age of 7 days. Rotate at a new UTC day or when full.
-- **Backups:** up to 5 files, each retained for at most 7 days.
-- **Accounting:** the latest state and one previous snapshot, not a new historical row each minute. Forget absent guests on the first check at least 7 days after their absence was first detected in the local panel list.
+- **Upgrade:** preserve active accounting data and the enabled/paused schedule.
+- **Uninstall:** remove the application, its Cron, accounting data, logs, and backups. Panel usage and quotas stay unchanged.
+- **Reinstall after removal:** start from current panel values, ignoring old accounting data.
+- **File retention:** logs up to 20 MiB and 7 days; up to 5 backups for 7 days. Deleted VPS records are removed on the first check at least 7 days after their absence is detected. Cleanup runs alongside the application's checks.
 
-Cleanup runs with accounting checks and installation/upgrades. Paused checks do not generate new log files. **Uninstall removes all data owned by this application**, leaving panel quotas, usage, and Virtualizor jobs unchanged. Copies of backups stored elsewhere are not removed.
-
-### Essential limitations
-
-The tool relies on panel statistics, not independent traffic metering. Reporting delays can miss consumption. A reset is missed if usage reaches the previous reading before the next observation. Resets before enrollment cannot be recovered.
-
-**Keep `/var/lib/reset-carryover/state.json`**: it holds the accounting history. Start troubleshooting with `status`, `logs`, and `doctor`. `resync` accepts current panel values as a new baseline and clears the saved fractional adjustment; it does not restore missing traffic.
+</details>
