@@ -22,7 +22,9 @@ A bandwidth carry-over tool for **KVM VPSs managed by Virtualizor**. After a usa
 
 ### نصب و مدیریت
 
-این نسخه برای **KVMهای محلی روی سرور Master با `serid=0`** نوشته شده؛ نودهای Slave را پوشش نمی‌دهد. محیط هدف AlmaLinux 9 است و به Python 3.9+، PHP و SDK محلی Virtualizor و سرویس فعال `crond` نیاز دارد.
+این نسخه برای **KVMهای محلی روی سرور Master با `serid=0`** نوشته شده؛ نودهای Slave را پوشش نمی‌دهد. محیط‌های هدف **AlmaLinux 9 و Ubuntu 22.04 / 24.04** هستند. Python 3.9+، PHP و SDK محلی Virtualizor و سرویس فعال Cron لازم‌اند.
+
+برنامه سرویس `cron` یا `crond` را خودکار تشخیص می‌دهد. اگر وابستگی‌ای کم باشد، دستور مناسب `apt-get` یا `dnf` را نشان می‌دهد؛ خودش بسته نصب نمی‌کند یا سرویس سیستم را روشن نمی‌کند. سازگاری با تست‌های شبیه‌سازی‌شده بررسی شده؛ اجرای کامل روی میزبان واقعی Ubuntu هنوز آزمایش نشده است.
 
 با کاربر `root` روی سرور اصلی اجرا کنید و گزینهٔ **۱ — Install / Upgrade** را بزنید:
 
@@ -78,7 +80,9 @@ It checks reported usage every minute. **Every observed decrease counts as a res
 
 ### Installation and management
 
-This release supports **local KVM guests on the Master host (`serid=0`)**, not Slave nodes. It targets AlmaLinux 9 and requires Python 3.9+, the local Virtualizor PHP/SDK installation, and an active `crond` service.
+This release supports **local KVM guests on the Master host (`serid=0`)**, not Slave nodes. Target systems are **AlmaLinux 9 and Ubuntu 22.04 / 24.04**, requiring Python 3.9+, the local Virtualizor PHP/SDK installation, and an active Cron service.
+
+The tool detects `cron` or `crond` and provides `apt-get` or `dnf` dependency instructions when needed. It does not install packages or start system services automatically. Compatibility has been checked with simulated tests; a full installation on a real Ubuntu Virtualizor host has not yet been tested.
 
 Run as `root` on the main host, then choose **1 — Install / Upgrade**:
 

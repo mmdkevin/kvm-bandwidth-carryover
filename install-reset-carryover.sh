@@ -2,7 +2,16 @@
 # KVM_BW_MANAGER_BOOTSTRAP_V2
 set -euo pipefail
 umask 077
-command -v python3 >/dev/null || { echo 'Python 3.9 or later is required.' >&2; exit 1; }
+if [[ ! -x /usr/bin/python3 ]]; then
+    echo 'Python 3.9+ is required at /usr/bin/python3.' >&2
+    if command -v apt-get >/dev/null; then
+        echo 'Run: apt-get update && apt-get install -y python3 cron curl ca-certificates coreutils logrotate bash' >&2
+    elif command -v dnf >/dev/null; then
+        echo 'Run: dnf install -y python3 cronie curl ca-certificates coreutils logrotate bash' >&2
+    fi
+    exit 1
+fi
+/usr/bin/python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,9) else "Python 3.9 or later is required.")'
 stage_dir="$(mktemp -d /tmp/kvm-bw.XXXXXX)"
 cleanup() {
     for filename in reset_carryover.py bridge.php carryover_manager.py test_reset_carryover.py test_carryover_manager.py; do
@@ -351,6 +360,8 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -358,7 +369,7 @@ import tempfile
 import time
 import urllib.request
 
-VERSION = '2.0.2'
+VERSION = '2.1.0'
 SOURCE_URL = 'https://raw.githubusercontent.com/mmdkevin/kvm-bandwidth-carryover/main/install-reset-carryover.sh'
 ASSETS = ('reset_carryover.py', 'bridge.php', 'carryover_manager.py',
           'test_reset_carryover.py', 'test_carryover_manager.py')
@@ -388,6 +399,39 @@ class Paths:
         self.php = self.root/'usr/local/emps/bin/php'
         self.sdk = self.root/'usr/local/virtualizor/sdk/admin.php'
         self.universal = self.root/'usr/local/virtualizor/universal.php'
+        self.python = self.root/'usr/bin/python3'
+
+
+def host_info(root):
+    """Read distribution metadata as data; never source/execute os-release."""
+    fields = {}
+    for relative in ('etc/os-release', 'usr/lib/os-release'):
+        file = root/relative
+        if not file.is_file():
+            continue
+        for line in file.read_text(encoding='utf-8').splitlines():
+            key, sep, value = line.partition('=')
+            if sep and key in ('ID', 'ID_LIKE', 'VERSION_ID', 'PRETTY_NAME'):
+                try:
+                    parts = shlex.split(value, comments=True)
+                    fields[key] = parts[0] if len(parts) == 1 else ''
+                except ValueError:
+                    pass
+        break
+    family = {fields.get('ID', ''), *fields.get('ID_LIKE', '').split()}
+    debian = bool(family & {'ubuntu', 'debian'})
+    rhel = bool(family & {'almalinux', 'rhel', 'centos', 'rocky', 'fedora'})
+    if debian:
+        hint = ('apt-get update && apt-get install -y python3 cron curl '
+                'ca-certificates coreutils logrotate bash')
+    elif rhel:
+        hint = 'dnf install -y python3 cronie curl ca-certificates coreutils logrotate bash'
+    else:
+        hint = 'Install Python 3.9+, cron/cronie, curl, ca-certificates, coreutils, logrotate and bash.'
+    return dict(id=fields.get('ID', 'unknown'), version=fields.get('VERSION_ID', ''),
+                name=fields.get('PRETTY_NAME') or 'Linux (distribution unknown)',
+                cron_services=('cron', 'crond') if debian else ('crond', 'cron'),
+                dependency_hint=hint)
 
 
 def atomic(path, data, mode=0o600):
@@ -468,6 +512,22 @@ class Manager:
     def __init__(self, paths=None, source=None):
         self.p = paths or Paths()
         self.source = Path(source or Path(__file__).resolve().parent)
+
+    def missing_commands(self):
+        return [name for name in ('systemctl', 'timeout', 'logrotate', 'bash')
+                if shutil.which(name) is None]
+
+    def cron_status(self):
+        info = host_info(self.p.root)
+        for service in info['cron_services']:
+            try:
+                result = subprocess.run(['systemctl', 'is-active', '--quiet', service],
+                                        capture_output=True, timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if result.returncode == 0:
+                return service, True
+        return info['cron_services'][0], False
 
     def guard_directories(self):
         for path in (self.p.app, self.p.data):
@@ -560,6 +620,13 @@ class Manager:
     def preflight(self):
         if sys.version_info < (3, 9):
             raise RuntimeError('Python 3.9 or later is required')
+        info = host_info(self.p.root)
+        missing = self.missing_commands()
+        if missing:
+            raise RuntimeError('Missing host commands: '+', '.join(missing)+
+                               '. Install dependencies: '+info['dependency_hint'])
+        if not self.p.python.is_file():
+            raise RuntimeError('/usr/bin/python3 is required. '+info['dependency_hint'])
         for file in (self.p.php, self.p.sdk, self.p.universal):
             if not file.is_file():
                 raise RuntimeError('Required file is missing: '+str(file))
@@ -567,11 +634,13 @@ class Manager:
         if old_cron.exists():
             raise RuntimeError('Disable the old native-carryover Cron first; its data will not be removed')
         if subprocess.run(['systemctl', 'is-active', '--quiet', 'vps-credit.timer'],
-                          capture_output=True).returncode == 0:
+                          capture_output=True, timeout=10).returncode == 0:
             raise RuntimeError('Old network-control version is active. Run: vps-credit disable')
-        if subprocess.run(['systemctl', 'is-active', '--quiet', 'crond'],
-                          capture_output=True).returncode != 0:
-            raise RuntimeError('crond is not active; start it before enabling automatic checks')
+        service, active = self.cron_status()
+        if not active:
+            raise RuntimeError('No active cron/crond service. Install dependencies if missing: '+
+                               info['dependency_hint']+'. Then run: systemctl enable --now '+service)
+        print('Host:', info['name'], '| Cron:', service)
 
     def core_command(self, *args):
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
@@ -795,7 +864,12 @@ class Manager:
             checks.append(bool(good))
             print(('PASS' if good else 'FAIL')+' '+label+(' | '+detail if detail else ''))
         check('Python >= 3.9', sys.version_info >= (3, 9), sys.version.split()[0])
-        for file in (self.p.php, self.p.sdk, self.p.universal, self.p.app/'bridge.php'):
+        info = host_info(self.p.root)
+        print('INFO Host:', info['name'])
+        missing = self.missing_commands()
+        check('Host commands available', not missing,
+              ', '.join(missing)+' | '+info['dependency_hint'] if missing else '')
+        for file in (self.p.python, self.p.php, self.p.sdk, self.p.universal, self.p.app/'bridge.php'):
             check('Required file '+file.name, file.is_file())
         try:
             state = validated_state(self.p.state)
@@ -803,9 +877,9 @@ class Manager:
             check('No held or pending corrections', not any(s['hold'] or s['pending'] for s in state['vms'].values()))
         except Exception as e:
             check('Accounting data readable', False, str(e))
-        active = subprocess.run(['systemctl', 'is-active', '--quiet', 'crond'], capture_output=True).returncode == 0
         if self.enabled():
-            check('Cron service active', active)
+            service, active = self.cron_status()
+            check('Cron service active', active, service)
             check('Cron uses managed scheduled-run command', 'scheduled-run' in self.p.cron.read_text())
         else:
             print('INFO Automatic checks are paused / not configured.')
@@ -952,8 +1026,8 @@ def main():
     if command == 'version':
         print(VERSION)
         return 0
-    if os.name == 'nt' or os.geteuid() != 0:
-        parser.error('Run on the AlmaLinux host as root')
+    if sys.platform != 'linux' or os.geteuid() != 0:
+        parser.error('Run on the Linux Virtualizor host as root')
     os.umask(0o077)
     manager = Manager(source=args.source)
     if command == 'menu':
@@ -1489,7 +1563,7 @@ class ManagementTests(unittest.TestCase):
     def test_doctor_is_read_only_and_intentional_pause_is_not_an_error(self):
         self.install()
         self.manager.pause()
-        for file in (self.paths.php, self.paths.sdk, self.paths.universal):
+        for file in (self.paths.python, self.paths.php, self.paths.sdk, self.paths.universal):
             file.parent.mkdir(parents=True, exist_ok=True)
             file.write_text('fixture')
         before = self.paths.state.read_bytes()
@@ -1500,7 +1574,8 @@ class ManagementTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, stdout='', stderr='')
             return subprocess.CompletedProcess(args, 0, stdout='{"vms":[{"id":"101"}]}', stderr='')
         with patch.object(m.subprocess, 'run', side_effect=result):
-            self.assertEqual(self.manager.doctor(), 0)
+            with patch.object(self.manager, 'missing_commands', return_value=[]):
+                self.assertEqual(self.manager.doctor(), 0)
         self.assertEqual(self.paths.state.read_bytes(), before)
         self.assertFalse(any('write' in call for call in calls))
 
@@ -1620,8 +1695,164 @@ class ManagementTests(unittest.TestCase):
         self.assertNotIn('\x1b', output.getvalue())
 
 
+class HostCompatibilityTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name)
+        self.paths = m.Paths(self.root/'host')
+        self.source = self.root/'source'
+        self.source.mkdir()
+        for name in m.ASSETS:
+            (self.source/name).write_text('# fixture '+name+'\n')
+        for file in (self.paths.python, self.paths.php, self.paths.sdk, self.paths.universal):
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text('fixture')
+        self.manager = m.Manager(self.paths, self.source)
+        self.active = set()
+        self.calls = []
+        quiet = contextlib.redirect_stdout(io.StringIO())
+        quiet.__enter__()
+        self.addCleanup(quiet.__exit__, None, None, None)
+        executor = patch.object(m.subprocess, 'run', side_effect=self.execute)
+        executor.start()
+        self.addCleanup(executor.stop)
+        commands = patch.object(m.shutil, 'which', side_effect=lambda name: '/usr/bin/'+name)
+        commands.start()
+        self.addCleanup(commands.stop)
+
+    def release(self, distro, version='9', like=''):
+        path = self.paths.root/'etc/os-release'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('ID='+distro+'\nVERSION_ID="'+version+'"\nID_LIKE="'+like+
+                        '"\nPRETTY_NAME="'+distro+' '+version+'"\n')
+
+    def execute(self, args, **kwargs):
+        self.calls.append(args)
+        if args[:3] == ['systemctl', 'is-active', '--quiet']:
+            return subprocess.CompletedProcess(args, 0 if args[3] in self.active else 3)
+        if args == [str(self.paths.php), str(self.paths.app/'bridge.php'), 'snapshot']:
+            return subprocess.CompletedProcess(args, 0, stdout='{"vms":[{"id":"101"}]}')
+        raise AssertionError('Unexpected host command: '+repr(args))
+
+    def ledger(self):
+        self.paths.app.mkdir(parents=True, exist_ok=True)
+        (self.paths.app/'reset_carryover.py').write_text('# installed')
+        (self.paths.app/'bridge.php').write_text('# bridge')
+        m.atomic(self.paths.state, json.dumps(state(), indent=4))
+        m.atomic(self.paths.cron, m.CRON, 0o644)
+        return self.paths.state.read_bytes()
+
+    def test_ubuntu_preflight_accepts_cron_on_22_and_24(self):
+        self.active = {'cron'}
+        for version in ('22.04', '24.04'):
+            with self.subTest(version=version):
+                self.release('ubuntu', version, 'debian')
+                self.calls.clear()
+                self.manager.preflight()
+                self.assertTrue(any(args[-1] == 'cron' for args in self.calls))
+                self.assertFalse(any(args[-1] == 'crond' for args in self.calls))
+                self.assertFalse(self.paths.state.exists())
+
+    def test_almalinux_preflight_keeps_crond(self):
+        self.release('almalinux', '9.5', 'rhel centos fedora')
+        self.active = {'crond'}
+        self.manager.preflight()
+        self.assertTrue(any(args[-1] == 'crond' for args in self.calls))
+        self.assertFalse(any(args[-1] == 'cron' for args in self.calls))
+
+    def test_ubuntu_falls_back_to_an_active_crond(self):
+        self.release('ubuntu', '24.04')
+        self.active = {'crond'}
+        self.assertEqual(self.manager.cron_status(), ('crond', True))
+        self.assertEqual([args[-1] for args in self.calls], ['cron', 'crond'])
+
+    def test_unknown_distribution_can_use_an_active_cron(self):
+        self.active = {'cron'}
+        self.assertEqual(self.manager.cron_status(), ('cron', True))
+
+    def test_inactive_ubuntu_cron_stops_before_writes_and_gives_correct_hint(self):
+        self.release('ubuntu', '24.04')
+        before = self.ledger()
+        with self.assertRaisesRegex(RuntimeError, 'systemctl enable --now cron$'):
+            self.manager.install()
+        self.assertEqual(self.paths.state.read_bytes(), before)
+        self.assertTrue(all(args[1:3] == ['is-active', '--quiet'] for args in self.calls))
+        self.assertFalse((self.paths.app/'VERSION').exists())
+
+    def test_missing_dependencies_give_distribution_package_commands_without_installing(self):
+        for distro, expected in (('ubuntu', 'apt-get'), ('almalinux', 'dnf')):
+            with self.subTest(distro=distro):
+                self.release(distro)
+                self.calls.clear()
+                with patch.object(m.shutil, 'which', return_value=None):
+                    with self.assertRaisesRegex(RuntimeError, expected):
+                        self.manager.preflight()
+                self.assertEqual(self.calls, [])
+                self.assertFalse(self.paths.state.exists())
+
+    def test_missing_system_python_reports_dependency_hint(self):
+        self.release('ubuntu', '24.04')
+        self.paths.python.unlink()
+        with self.assertRaisesRegex(RuntimeError, '/usr/bin/python3 is required.*apt-get'):
+            self.manager.preflight()
+        self.assertEqual(self.calls, [])
+
+    def test_missing_panel_sdk_stops_before_host_service_queries(self):
+        self.release('ubuntu', '24.04')
+        self.paths.sdk.unlink()
+        with self.assertRaisesRegex(RuntimeError, 'Required file is missing'):
+            self.manager.preflight()
+        self.assertEqual(self.calls, [])
+
+    def test_ubuntu_doctor_uses_cron_and_leaves_ledger_unchanged(self):
+        self.release('ubuntu', '24.04', 'debian')
+        self.active = {'cron'}
+        before = self.ledger()
+        self.assertEqual(self.manager.doctor(), 0)
+        self.assertEqual(self.paths.state.read_bytes(), before)
+        services = [args[-1] for args in self.calls if args[0] == 'systemctl']
+        self.assertEqual(services, ['cron'])
+
+    def test_service_command_failure_is_reported_as_inactive(self):
+        self.release('ubuntu', '24.04')
+        with patch.object(m.subprocess, 'run', side_effect=FileNotFoundError('systemctl')):
+            self.assertEqual(self.manager.cron_status(), ('cron', False))
+
+    def test_os_release_fallback_and_quoted_family(self):
+        file = self.paths.root/'usr/lib/os-release'
+        file.parent.mkdir(parents=True)
+        file.write_text('ID=ubuntu\nID_LIKE="debian"\nPRETTY_NAME="Ubuntu 24.04 LTS"\n')
+        info = m.host_info(self.paths.root)
+        self.assertEqual(info['name'], 'Ubuntu 24.04 LTS')
+        self.assertEqual(info['cron_services'][0], 'cron')
+        self.assertIn('apt-get', info['dependency_hint'])
+        self.assertEqual(self.calls, [])
+
+    def test_os_release_does_not_execute_shell_values(self):
+        self.release('ubuntu', '24.04')
+        file = self.paths.root/'etc/os-release'
+        file.write_text('ID=ubuntu\nPRETTY_NAME="$(touch /tmp/do-not-run)"\n')
+        info = m.host_info(self.paths.root)
+        self.assertEqual(info['name'], '$(touch /tmp/do-not-run)')
+        self.assertEqual(self.calls, [])
+
+    def test_real_preflight_upgrade_preserves_ledger_on_both_platforms(self):
+        for distro, active in (('ubuntu', 'cron'), ('almalinux', 'crond')):
+            with self.subTest(distro=distro):
+                self.release(distro)
+                self.active = {active}
+                before = self.ledger()
+                with patch.object(self.manager, 'validate_source'):
+                    self.manager.install()
+                self.assertEqual(self.paths.state.read_bytes(), before)
+                self.assertEqual((self.paths.app/'VERSION').read_text().strip(), m.VERSION)
+                self.assertTrue(self.manager.enabled())
+                self.assertTrue(list((self.paths.data/'backups').glob('*.tar.gz')))
+
+
 if __name__ == '__main__':
     unittest.main()
 
 RC_MANAGER_TEST
-PYTHONDONTWRITEBYTECODE=1 python3 "$stage_dir/carryover_manager.py" --source "$stage_dir" "$@"
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 "$stage_dir/carryover_manager.py" --source "$stage_dir" "$@"
