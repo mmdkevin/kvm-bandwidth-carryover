@@ -358,7 +358,7 @@ import tempfile
 import time
 import urllib.request
 
-VERSION = '2.0.1'
+VERSION = '2.0.2'
 SOURCE_URL = 'https://raw.githubusercontent.com/mmdkevin/kvm-bandwidth-carryover/main/install-reset-carryover.sh'
 ASSETS = ('reset_carryover.py', 'bridge.php', 'carryover_manager.py',
           'test_reset_carryover.py', 'test_carryover_manager.py')
@@ -439,6 +439,29 @@ def terminal_input():
     finally:
         if owned:
             stream.close()
+
+
+class MenuScreen:
+    """Keep menu pages in an alternate screen; leave CLI/log output untouched."""
+    def __init__(self, output=None):
+        self.output = output if output is not None else sys.stdout
+        self.enabled = bool(self.output.isatty() and os.environ.get('TERM') != 'dumb')
+
+    def __enter__(self):
+        if self.enabled:
+            self.output.write('\x1b[?1049h')
+            self.output.flush()
+        return self
+
+    def clear(self):
+        if self.enabled:
+            self.output.write('\x1b[2J\x1b[H')
+            self.output.flush()
+
+    def __exit__(self, *error):
+        if self.enabled:
+            self.output.write('\x1b[?1049l')
+            self.output.flush()
 
 
 class Manager:
@@ -842,7 +865,7 @@ class Manager:
             return subprocess.run(['bash', str(file), 'upgrade']).returncode
 
     def menu(self):
-        with terminal_input() as tty:
+        with terminal_input() as tty, MenuScreen() as screen:
             def ask(prompt):
                 print(prompt, end='', flush=True)
                 try:
@@ -851,7 +874,9 @@ class Manager:
                     return None
                 return line.strip() if line else None
             while True:
-                print('\nKVM Bandwidth Carryover v'+VERSION+' | installed: '+self.installed_version())
+                screen.clear()
+                print('KVM Bandwidth Carryover v'+VERSION+' | installed: '+self.installed_version())
+                print('-' * 68)
                 print('1) Install / Upgrade\n2) Status\n3) Preview changes (read-only)\n4) Run one check')
                 print('5) Enable automatic checks\n6) Pause automatic checks\n7) Logs\n8) Doctor')
                 print('9) Backup\n10) Commands\n11) Uninstall (keep accounting data)\n0) Exit')
@@ -859,6 +884,13 @@ class Manager:
                 try:
                     if choice is None or choice == '0':
                         return 0
+                    screen.clear()
+                    titles = {'1': 'Install / Upgrade', '2': 'Status', '3': 'Preview changes',
+                              '4': 'Run one check', '5': 'Enable automatic checks',
+                              '6': 'Pause automatic checks', '7': 'Logs', '8': 'Doctor',
+                              '9': 'Backup', '10': 'Commands', '11': 'Uninstall'}
+                    print('KVM Bandwidth Carryover | '+titles.get(choice, 'Unknown option'))
+                    print('-' * 68)
                     actions = {'1': lambda: self.remote_upgrade() if self.source.resolve() == self.p.app.resolve() else self.install(),
                                '2': self.status, '3': self.preview, '4': self.run, '5': self.enable,
                                '6': self.pause, '7': self.logs, '8': self.doctor, '9': self.backup,
@@ -1526,6 +1558,66 @@ class ManagementTests(unittest.TestCase):
         with patch.object(m, 'open', return_value=io.StringIO('10\nq\n'), create=True):
             self.assertEqual(self.manager.menu(), 0)
         self.assertEqual(self.paths.state.read_bytes(), before)
+
+    def test_menu_redraws_pages_in_place_and_restores_shell(self):
+        class TerminalOutput(io.StringIO):
+            def isatty(self): return True
+        output = TerminalOutput()
+        with patch.dict(m.os.environ, {'TERM': 'xterm-256color'}):
+            with patch.object(m, 'open', return_value=io.StringIO('10\n\n0\n'), create=True):
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(self.manager.menu(), 0)
+        text = output.getvalue()
+        pages = text.split('\x1b[2J\x1b[H')
+        self.assertEqual(len(pages), 4)  # menu, commands page, refreshed menu
+        self.assertIn('1) Install / Upgrade', pages[1])
+        self.assertIn('kvm-bw status', pages[2])
+        self.assertNotIn('1) Install / Upgrade', pages[2])
+        self.assertIn('1) Install / Upgrade', pages[3])
+        self.assertNotIn('kvm-bw status', pages[3])
+        self.assertEqual(text.count('\x1b[?1049h'), 1)
+        self.assertTrue(text.endswith('\x1b[?1049l'))
+
+    def test_interrupt_restores_shell_screen(self):
+        class TerminalOutput(io.StringIO):
+            def isatty(self): return True
+        class Interrupted(io.StringIO):
+            def readline(self, *args): raise KeyboardInterrupt()
+        output = TerminalOutput()
+        with patch.dict(m.os.environ, {'TERM': 'xterm'}):
+            with patch.object(m, 'open', return_value=Interrupted(), create=True):
+                with contextlib.redirect_stdout(output):
+                    with self.assertRaises(KeyboardInterrupt):
+                        self.manager.menu()
+        self.assertTrue(output.getvalue().endswith('\x1b[?1049l'))
+        self.assertFalse(self.paths.data.exists())
+
+    def test_menu_output_redirected_to_file_has_no_screen_control_codes(self):
+        output = io.StringIO()
+        with patch.object(m, 'open', return_value=io.StringIO('0\n'), create=True):
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(self.manager.menu(), 0)
+        self.assertNotIn('\x1b', output.getvalue())
+
+    def test_dumb_terminal_is_not_sent_unsupported_screen_codes(self):
+        class TerminalOutput(io.StringIO):
+            def isatty(self): return True
+        output = TerminalOutput()
+        with patch.dict(m.os.environ, {'TERM': 'dumb'}):
+            with patch.object(m, 'open', return_value=io.StringIO('0\n'), create=True):
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(self.manager.menu(), 0)
+        self.assertNotIn('\x1b', output.getvalue())
+
+    def test_status_command_does_not_clear_interactive_terminal(self):
+        class TerminalOutput(io.StringIO):
+            def isatty(self): return True
+        self.install()
+        output = TerminalOutput()
+        with contextlib.redirect_stdout(output):
+            self.manager.status()
+        self.assertIn('VPS_ID', output.getvalue())
+        self.assertNotIn('\x1b', output.getvalue())
 
 
 if __name__ == '__main__':
