@@ -5,9 +5,9 @@ umask 077
 if [[ ! -x /usr/bin/python3 ]]; then
     echo 'Python 3.9+ is required at /usr/bin/python3.' >&2
     if command -v apt-get >/dev/null; then
-        echo 'Run: apt-get update && apt-get install -y python3 cron curl ca-certificates coreutils logrotate bash' >&2
+        echo 'Run: apt-get update && apt-get install -y python3 cron curl ca-certificates coreutils bash' >&2
     elif command -v dnf >/dev/null; then
-        echo 'Run: dnf install -y python3 cronie curl ca-certificates coreutils logrotate bash' >&2
+        echo 'Run: dnf install -y python3 cronie curl ca-certificates coreutils bash' >&2
     fi
     exit 1
 fi
@@ -44,6 +44,7 @@ import time
 STATE_DIR = Path('/var/lib/reset-carryover')
 PHP = '/usr/local/emps/bin/php'
 BRIDGE = '/opt/reset-carryover/bridge.php'
+ABSENT_RETENTION = 30 * 86400
 
 
 def amount(value):
@@ -147,6 +148,25 @@ def log(event, key='', detail=''):
 
 def process(state, snapshot, bridge, persist):
     problems = []
+    # Only mark absence after receiving the complete current local VPS list.
+    # Active held/pending records must never expire merely because they are old.
+    now = int(snapshot['now'])
+    present = {str(vm['id']) for vm in snapshot['vms']}
+    changed = False
+    for key, old in list(state['vms'].items()):
+        if key in present:
+            if 'missing_since' in old:
+                old.pop('missing_since')
+                changed = True
+        elif 'missing_since' not in old:
+            old['missing_since'] = now
+            changed = True
+        elif now - int(old['missing_since']) >= ABSENT_RETENTION:
+            del state['vms'][key]
+            changed = True
+            log('FORGOTTEN-ABSENT', key)
+    if changed:
+        persist(state)
     for vm in snapshot['vms']:
         key = str(vm['id'])
         old = state['vms'].get(key)
@@ -217,7 +237,7 @@ def main():
     parser.add_argument('value', nargs='?')
     args = parser.parse_args()
     if os.name == 'nt' or os.geteuid() != 0:
-        parser.error('Run on the AlmaLinux host as root')
+        parser.error('Run on the Linux Virtualizor host as root')
     import fcntl
     os.umask(0o077)
     STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -351,15 +371,16 @@ try {
 RC_BRIDGE
 cat > "$stage_dir/carryover_manager.py" <<'RC_MANAGER'
 #!/usr/bin/env python3
-"""KVM Bandwidth Carryover management commands. Accounting data survives uninstall."""
+"""Virtualizor KVM bandwidth carry-over with bounded storage and complete removal."""
 import argparse
 from collections import deque
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout, redirect_stderr
 from datetime import datetime
 import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
@@ -369,18 +390,21 @@ import tempfile
 import time
 import urllib.request
 
-VERSION = '2.1.0'
+VERSION = '2.2.0'
+DAY = 86400
+LOG_BYTES = 5 * 1024 * 1024
+LOG_ARCHIVES = 3
+LOG_DAYS = 7
+BACKUP_COUNT = 5
+BACKUP_DAYS = 7
 SOURCE_URL = 'https://raw.githubusercontent.com/mmdkevin/kvm-bandwidth-carryover/main/install-reset-carryover.sh'
 ASSETS = ('reset_carryover.py', 'bridge.php', 'carryover_manager.py',
           'test_reset_carryover.py', 'test_carryover_manager.py')
 CRON = ('SHELL=/bin/bash\n'
         'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n'
-        '* * * * * root timeout 55s /usr/local/sbin/reset-carryover scheduled-run '
-        '>> /var/log/reset-carryover.log 2>&1\n')
+        '* * * * * root timeout 55s /usr/local/sbin/reset-carryover scheduled-run\n')
 WRAPPER = ('#!/usr/bin/env bash\nset -euo pipefail\numask 077\n'
            'exec /usr/bin/python3 /opt/reset-carryover/carryover_manager.py "$@"\n')
-ROTATE = ('/var/log/reset-carryover.log {\n    size 5M\n    rotate 7\n'
-          '    compress\n    missingok\n    notifempty\n    create 0600 root root\n}\n')
 
 
 class Paths:
@@ -423,11 +447,11 @@ def host_info(root):
     rhel = bool(family & {'almalinux', 'rhel', 'centos', 'rocky', 'fedora'})
     if debian:
         hint = ('apt-get update && apt-get install -y python3 cron curl '
-                'ca-certificates coreutils logrotate bash')
+                'ca-certificates coreutils bash')
     elif rhel:
-        hint = 'dnf install -y python3 cronie curl ca-certificates coreutils logrotate bash'
+        hint = 'dnf install -y python3 cronie curl ca-certificates coreutils bash'
     else:
-        hint = 'Install Python 3.9+, cron/cronie, curl, ca-certificates, coreutils, logrotate and bash.'
+        hint = 'Install Python 3.9+, cron/cronie, curl, ca-certificates, coreutils and bash.'
     return dict(id=fields.get('ID', 'unknown'), version=fields.get('VERSION_ID', ''),
                 name=fields.get('PRETTY_NAME') or 'Linux (distribution unknown)',
                 cron_services=('cron', 'crond') if debian else ('crond', 'cron'),
@@ -464,6 +488,83 @@ def validated_state(path):
             if key not in s:
                 raise RuntimeError('Incomplete accounting record: '+key)
     return state
+
+
+def prune_files(files, keep, max_age, max_bytes=None):
+    now = time.time()
+    entries = sorted(((file.stat().st_mtime, file) for file in files
+                      if file.is_file() and not file.is_symlink()),
+                     key=lambda item: (item[0], item[1].name), reverse=True)
+    retained = 0
+    for modified, file in entries:
+        if (now - modified > max_age or retained >= keep or
+                (max_bytes is not None and file.stat().st_size > max_bytes)):
+            file.unlink()
+        else:
+            retained += 1
+
+
+class BoundedLog:
+    """A UTF-8 print stream; limit each file, including a single large write."""
+    encoding = 'utf-8'
+
+    def __init__(self, path):
+        self.path = path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for file in [path] + [Path(str(path)+'.'+str(i)) for i in range(1, LOG_ARCHIVES+1)]:
+            if file.is_symlink():
+                raise RuntimeError('Refusing log symlink: '+str(file))
+        daily_rotation = False
+        if path.exists():
+            if time.time() - path.stat().st_mtime > LOG_DAYS * DAY:
+                path.unlink()
+            elif path.stat().st_size > LOG_BYTES:
+                with path.open('rb') as file:
+                    file.seek(-LOG_BYTES, os.SEEK_END)
+                    tail = file.read().decode('utf-8', errors='ignore').encode('utf-8')
+                atomic(path, tail)
+            if path.exists():
+                daily_rotation = int(path.stat().st_mtime // DAY) != int(time.time() // DAY)
+        self.file = path.open('ab')
+        os.chmod(path, 0o600)
+        if daily_rotation and self.file.tell():
+            self.rotate()
+
+    def rotate(self):
+        self.file.close()
+        oldest = Path(str(self.path)+'.'+str(LOG_ARCHIVES))
+        if oldest.exists():
+            oldest.unlink()
+        for i in range(LOG_ARCHIVES-1, 0, -1):
+            file = Path(str(self.path)+'.'+str(i))
+            if file.exists():
+                os.replace(file, Path(str(self.path)+'.'+str(i+1)))
+        os.replace(self.path, Path(str(self.path)+'.1'))
+        self.file = self.path.open('ab')
+        os.chmod(self.path, 0o600)
+
+    def write(self, text):
+        data = text.encode('utf-8', errors='replace')
+        while data:
+            room = LOG_BYTES - self.file.tell()
+            end = min(len(data), max(room, 0))
+            while end > 0 and end < len(data) and data[end] & 0xc0 == 0x80:
+                end -= 1
+            if not end:
+                self.rotate()
+                continue
+            self.file.write(data[:end])
+            data = data[end:]
+        return len(text)
+
+    def flush(self):
+        self.file.flush()
+
+    def isatty(self):
+        return False
+
+    def close(self):
+        self.file.close()
 
 
 @contextmanager
@@ -514,8 +615,55 @@ class Manager:
         self.source = Path(source or Path(__file__).resolve().parent)
 
     def missing_commands(self):
-        return [name for name in ('systemctl', 'timeout', 'logrotate', 'bash')
+        return [name for name in ('systemctl', 'timeout', 'bash')
                 if shutil.which(name) is None]
+
+    @contextmanager
+    def locked_log(self, nonblocking=False):
+        self.guard_directories()
+        with (self.p.data/'log.lock').open('a') as file:
+            if os.name != 'nt':
+                import fcntl
+                fcntl.flock(file, fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0))
+            yield
+
+    def log_archives(self):
+        pattern = re.compile(re.escape(self.p.log.name)+r'(?:\.\d+(?:\.gz)?|-\d+(?:\.gz)?)$')
+        return [file for file in self.p.log.parent.glob(self.p.log.name+'*')
+                if pattern.fullmatch(file.name)]
+
+    def prune_logs(self):
+        prune_files(self.log_archives(), LOG_ARCHIVES, LOG_DAYS * DAY, LOG_BYTES)
+
+    def prune_backups(self):
+        folder = self.p.data/'backups'
+        if folder.is_symlink():
+            raise RuntimeError('Backup directory must not be a symlink')
+        files = list(folder.glob('backup-*.tar.gz')) + list(self.p.data.glob('backup-*.json'))
+        prune_files(files, BACKUP_COUNT, BACKUP_DAYS * DAY)
+
+    def scheduled_run(self):
+        if not self.installed() or self.p.paused.exists() or not self.p.cron.is_file():
+            return 0
+        try:
+            with self.locked_log(nonblocking=True):
+                # Uninstall may have completed while this process waited to enter.
+                if not self.installed() or self.p.paused.exists() or not self.p.cron.is_file():
+                    return 0
+                self.prune_logs()
+                stream = BoundedLog(self.p.log)
+                try:
+                    with redirect_stdout(stream), redirect_stderr(stream):
+                        try:
+                            return self.run(scheduled=True)
+                        except Exception as error:
+                            print('ERROR:', error)
+                            return 1
+                finally:
+                    stream.close()
+                    self.prune_logs()
+        except BlockingIOError:
+            return 0
 
     def cron_status(self):
         info = host_info(self.p.root)
@@ -534,6 +682,12 @@ class Manager:
             if path.is_symlink():
                 raise RuntimeError('Managed directory must not be a symlink: '+str(path))
         self.p.data.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(self.p.data, 0o700)
+        for path in (self.p.state, self.p.data/'state.previous.json', self.p.heartbeat,
+                     self.p.paused, self.p.data/'lock', self.p.data/'operation.lock',
+                     self.p.data/'log.lock'):
+            if path.is_symlink():
+                raise RuntimeError('Managed data file must not be a symlink: '+str(path))
 
     @contextmanager
     def locked(self, core=False, nonblocking=False):
@@ -575,6 +729,8 @@ class Manager:
 
     def _backup(self):
         folder = self.p.data/'backups'
+        if folder.is_symlink():
+            raise RuntimeError('Backup directory must not be a symlink')
         folder.mkdir(mode=0o700, parents=True, exist_ok=True)
         archive = folder/('backup-'+datetime.now().strftime('%Y%m%d-%H%M%S-')+str(time.time_ns())+'.tar.gz')
         selected = [(self.p.state, 'data/state.json'),
@@ -588,6 +744,7 @@ class Manager:
                 if file.is_file() and not file.is_symlink():
                     tar.add(file, arcname=name, recursive=False)
         os.chmod(archive, 0o600)
+        self.prune_backups()
         return archive
 
     def backup(self):
@@ -666,16 +823,23 @@ class Manager:
         with self.locked(core=True):
             existing = self.installed()
             was_enabled = self.enabled()
-            old_state = self.p.state.read_bytes() if self.p.state.exists() else None
+            # An active installation is upgraded. Leftovers after removal are
+            # never used as the baseline for a new installation.
+            old_state = self.p.state.read_bytes() if existing and self.p.state.exists() else None
+            if existing and old_state is None:
+                raise RuntimeError('Installed accounting state is missing; inspect before upgrading')
             if old_state is not None:
                 old_saved = validated_state(self.p.state)
                 if policy is not None and policy != old_saved['policy']:
                     raise RuntimeError('Upgrade preserves the current policy. Use: kvm-bw policy '+policy)
-            backup = self._backup() if existing or old_state is not None else None
+            backup = self._backup() if existing else None
             files = [self.p.app/name for name in (*ASSETS, 'VERSION')]
             files += [self.p.command, self.p.alias, self.p.cron, self.p.rotate, self.p.paused]
+            files += [self.p.state, self.p.data/'state.previous.json', self.p.heartbeat]
             previous = {file: (file.read_bytes(), file.stat().st_mode & 0o777)
                         if file.is_file() and not file.is_symlink() else None for file in files}
+            if any(file.is_symlink() for file in files):
+                raise RuntimeError('Refusing a symlink in managed installation files')
             try:
                 self.p.app.mkdir(mode=0o700, parents=True, exist_ok=True)
                 for name in ASSETS:
@@ -687,9 +851,18 @@ class Manager:
                     # Initialize in this process while both locks remain held.
                     # Do not start a subprocess that would re-lock the ledger.
                     self.initialize_unlocked(policy or 'minimum-1gb')
+                    for file in (self.p.data/'state.previous.json', self.p.heartbeat):
+                        if file.exists():
+                            file.unlink()
                 elif self.p.state.read_bytes() != old_state:
                     raise RuntimeError('Accounting data changed unexpectedly during upgrade')
-                atomic(self.p.rotate, ROTATE, 0o644)
+                if self.p.rotate.exists():
+                    self.p.rotate.unlink()  # Rotation is handled by scheduled-run.
+                self.prune_backups()
+                with self.locked_log():
+                    self.prune_logs()
+                    stream = BoundedLog(self.p.log)
+                    stream.close()
                 self._schedule(was_enabled if existing else True)
             except Exception:
                 for file, contents in previous.items():
@@ -715,9 +888,10 @@ class Manager:
         bridge = core.Bridge()
         snapshot = bridge.snapshot()
         state = dict(version=2, policy=policy, vms={})
-        problems = core.process(state, snapshot, bridge, lambda s: core.save(self.p.state, s))
+        problems = core.process(state, snapshot, bridge, lambda s: None)
         if problems or not state['vms']:
-            raise RuntimeError('Initial enrollment failed; accounting data retained, Cron not enabled')
+            raise RuntimeError('Initial enrollment failed; Cron not enabled')
+        core.save(self.p.state, state)
 
     def pause(self):
         self.guard_directories()
@@ -745,6 +919,7 @@ class Manager:
                     return 0
                 if not self.installed() or not self.p.state.exists():
                     raise RuntimeError('Not installed or accounting state missing')
+                self.prune_backups()
                 started = time.time()
                 try:
                     result = self.core_command('run')
@@ -898,13 +1073,27 @@ class Manager:
         return 0 if all(checks) else 1
 
     def uninstall(self):
-        if not self.installed() and not self.p.state.exists():
-            print('Not installed; no accounting data found. Nothing changed.')
+        remnants = any(path.exists() or path.is_symlink() for path in
+                       (self.p.app, self.p.data, self.p.command, self.p.alias,
+                        self.p.cron, self.p.rotate, self.p.log)) or bool(self.log_archives())
+        if not remnants:
+            print('Not installed. Nothing to remove.')
             return
+        # Verify exact owned paths before recursive removal of the private data
+        # directory. Never follow an alternate data/app root or a symlink.
+        for path, relative in ((self.p.data, 'var/lib/reset-carryover'),
+                               (self.p.app, 'opt/reset-carryover'),
+                               (self.p.cron, 'etc/cron.d/reset-carryover'),
+                               (self.p.rotate, 'etc/logrotate.d/reset-carryover'),
+                               (self.p.command, 'usr/local/sbin/reset-carryover'),
+                               (self.p.alias, 'usr/local/sbin/kvm-bw'),
+                               (self.p.log, 'var/log/reset-carryover.log')):
+            expected = self.p.root.resolve()/relative
+            if path.is_symlink() or path.resolve() != expected:
+                raise RuntimeError('Refusing unexpected removal target: '+str(path))
         self.guard_directories()
-        atomic(self.p.paused, 'Uninstalled; accounting history intentionally retained.\n')
+        self._schedule(False)
         with self.locked(core=True):
-            backup = self._backup()
             owned = [self.p.cron, self.p.rotate, self.p.command, self.p.alias]
             owned += [self.p.app/name for name in (*ASSETS, 'VERSION')]
             for file in owned:
@@ -923,9 +1112,14 @@ class Manager:
                     cache.rmdir()
             if self.p.app.is_dir() and not any(self.p.app.iterdir()):
                 self.p.app.rmdir()
-        print('UNINSTALLED: program and its Cron removed.')
-        print('Panel quotas unchanged. Accounting data and logs retained.')
-        print('Data:', self.p.data, '| backup:', backup)
+            with self.locked_log():
+                for file in [self.p.log] + self.log_archives():
+                    if file.is_symlink() or file.is_file():
+                        file.unlink()
+        # Locks must be closed before deleting their directory on Windows too.
+        shutil.rmtree(self.p.data)
+        print('UNINSTALLED: application, Cron, accounting data, backups and logs removed.')
+        print('Panel quotas and Virtualizor jobs unchanged.')
 
     def remote_upgrade(self):
         with urllib.request.urlopen(SOURCE_URL, timeout=30) as response:
@@ -953,7 +1147,7 @@ class Manager:
                 print('-' * 68)
                 print('1) Install / Upgrade\n2) Status\n3) Preview changes (read-only)\n4) Run one check')
                 print('5) Enable automatic checks\n6) Pause automatic checks\n7) Logs\n8) Doctor')
-                print('9) Backup\n10) Commands\n11) Uninstall (keep accounting data)\n0) Exit')
+                print('9) Backup\n10) Commands\n11) Uninstall completely\n0) Exit')
                 choice = ask('Select: ')
                 try:
                     if choice is None or choice == '0':
@@ -995,7 +1189,7 @@ kvm-bw resync VPS_ID       Accept current panel state as the new baseline
 kvm-bw policy hold         Hold corrections when the balance is below 1GB
 kvm-bw policy minimum-1gb  Use a minimum finite quota of 1GB
 kvm-bw upgrade             Download a newer installer; preserve history
-kvm-bw uninstall           Remove program/Cron; keep data and panel quotas
+kvm-bw uninstall           Remove program/Cron, accounting data, logs and backups
 kvm-bw version             Print version
 The legacy reset-carryover command supports these same subcommands.''')
 
@@ -1058,8 +1252,10 @@ def main():
         manager.policy(args.value)
     elif command == 'doctor':
         return manager.doctor()
-    elif command in ('run', 'scheduled-run'):
-        return manager.run(command == 'scheduled-run')
+    elif command == 'scheduled-run':
+        return manager.scheduled_run()
+    elif command == 'run':
+        return manager.run()
     return 0
 
 
@@ -1067,7 +1263,7 @@ if __name__ == '__main__':
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        print('\nCancelled. Accounting data retained.', file=sys.stderr)
+        print('\nCancelled.', file=sys.stderr)
         sys.exit(130)
     except Exception as error:
         print('ERROR:', error, file=sys.stderr)
@@ -1274,6 +1470,42 @@ class ResetTests(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text())['value'], 2)
             self.assertEqual(json.loads(path.with_suffix('.previous.json').read_text())['value'], 1)
 
+    def test_missing_guest_is_retained_for_thirty_days_then_forgotten(self):
+        state = self.state()
+        saved = []
+        bridge = FakeBridge(saved)
+        for now in (1000, 1000+r.ABSENT_RETENTION-1):
+            r.process(state, dict(now=now, vms=[]), bridge,
+                      lambda value: saved.append(copy.deepcopy(value)))
+            self.assertIn('101', state['vms'])
+        r.process(state, dict(now=1000+r.ABSENT_RETENTION, vms=[]), bridge,
+                  lambda value: saved.append(copy.deepcopy(value)))
+        self.assertNotIn('101', state['vms'])
+        self.assertEqual(bridge.writes, [])
+        self.assertEqual(saved[-1]['vms'], {})
+
+    def test_old_held_guest_that_is_still_present_is_not_forgotten(self):
+        state = self.state()
+        state['vms']['101']['hold'] = 'review'
+        saved = []
+        bridge = FakeBridge(saved)
+        r.process(state, dict(now=100*r.ABSENT_RETENTION, vms=[self.new]), bridge,
+                  lambda value: saved.append(copy.deepcopy(value)))
+        self.assertIn('101', state['vms'])
+        self.assertEqual(state['vms']['101']['hold'], 'review')
+        self.assertNotIn('missing_since', state['vms']['101'])
+        self.assertEqual(bridge.writes, [])
+
+    def test_returning_guest_clears_absence_timer_before_expiry(self):
+        state = self.state()
+        state['vms']['101']['missing_since'] = 1
+        state['vms']['101']['hold'] = 'review'
+        saved = []
+        bridge = FakeBridge(saved)
+        r.process(state, self.snap(), bridge, lambda value: saved.append(copy.deepcopy(value)))
+        self.assertNotIn('missing_since', state['vms']['101'])
+        self.assertEqual(bridge.writes, [])
+
 
 if __name__ == '__main__':
     unittest.main()
@@ -1288,10 +1520,12 @@ from pathlib import Path
 import subprocess
 import tarfile
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import carryover_manager as m
+import reset_carryover as core
 
 
 def state():
@@ -1383,6 +1617,8 @@ class ManagementTests(unittest.TestCase):
         self.assertIn('scheduled-run', self.paths.cron.read_text())
 
     def test_invalid_saved_state_is_not_reinitialized(self):
+        self.paths.app.mkdir(parents=True)
+        (self.paths.app/'reset_carryover.py').write_text('# installed')
         self.paths.data.mkdir(parents=True)
         self.paths.state.write_text('{broken')
         with self.assertRaises(ValueError):
@@ -1400,10 +1636,11 @@ class ManagementTests(unittest.TestCase):
         self.assertEqual(self.paths.state.read_bytes(), original)
         self.assertEqual(self.manager.calls, [])
 
-    def test_uninstall_removes_program_but_preserves_state_log_and_other_files(self):
+    def test_uninstall_removes_own_data_logs_backups_and_keeps_unrelated_files(self):
         self.install()
-        original = self.paths.state.read_bytes()
         self.paths.log.write_text('audit history')
+        Path(str(self.paths.log)+'.1').write_text('old log')
+        self.manager.backup()
         unrelated = self.paths.app/'unrelated.txt'
         unrelated.write_text('keep')
         virtualizor = self.paths.root/'etc/cron.d/virtualizor'
@@ -1413,19 +1650,19 @@ class ManagementTests(unittest.TestCase):
         self.assertFalse(self.paths.alias.exists())
         self.assertFalse(self.paths.cron.exists())
         self.assertFalse(self.manager.installed())
-        self.assertEqual(self.paths.state.read_bytes(), original)
-        self.assertEqual(self.paths.log.read_text(), 'audit history')
+        self.assertFalse(self.paths.data.exists())
+        self.assertFalse(self.paths.log.exists())
+        self.assertFalse(Path(str(self.paths.log)+'.1').exists())
         self.assertEqual(unrelated.read_text(), 'keep')
         self.assertEqual(virtualizor.read_text(), 'original panel cron')
         self.assertEqual(self.manager.calls, [])
 
-    def test_reinstall_after_uninstall_preserves_history(self):
+    def test_reinstall_after_uninstall_enrolls_again(self):
         self.install()
-        original = self.paths.state.read_bytes()
         self.manager.uninstall()
+        self.assertFalse(self.paths.data.exists())
         self.manager.install()
-        self.assertEqual(self.paths.state.read_bytes(), original)
-        self.assertEqual(self.manager.initialized, 1)
+        self.assertEqual(self.manager.initialized, 2)
         self.assertTrue(self.manager.enabled())
 
     def test_backup_contains_ledger_and_excludes_backups_and_credentials(self):
@@ -1693,6 +1930,203 @@ class ManagementTests(unittest.TestCase):
             self.manager.status()
         self.assertIn('VPS_ID', output.getvalue())
         self.assertNotIn('\x1b', output.getvalue())
+
+
+class StorageLifecycleTests(unittest.TestCase):
+    setUp = ManagementTests.setUp
+    install = ManagementTests.install
+
+    def test_fresh_install_ignores_stale_valid_state_policy_and_metadata(self):
+        stale = state()
+        stale['policy'] = 'hold'
+        stale['vms']['999'] = stale['vms'].pop('101')
+        m.atomic(self.paths.state, json.dumps(stale))
+        m.atomic(self.paths.heartbeat, '{"last_success": 1}')
+        m.atomic(self.paths.data/'state.previous.json', '{"old":true}')
+        self.install()
+        current = json.loads(self.paths.state.read_text())
+        self.assertEqual(current['policy'], 'minimum-1gb')
+        self.assertEqual(set(current['vms']), {'101'})
+        self.assertEqual(self.manager.initialized, 1)
+        self.assertFalse(self.paths.heartbeat.exists())
+        self.assertFalse((self.paths.data/'state.previous.json').exists())
+
+    def test_fresh_install_ignores_corrupt_leftover_state(self):
+        m.atomic(self.paths.state, '{broken')
+        self.install()
+        self.assertEqual(self.manager.initialized, 1)
+        self.assertEqual(json.loads(self.paths.state.read_text())['version'], 2)
+
+    def test_fresh_install_uses_actual_snapshot_without_any_quota_writes(self):
+        snapshot = dict(now=12345, vms=[dict(id='202', name='current-vm', uuid='current-id',
+                                           limit='5300', used='1700.25')])
+        class Bridge:
+            def snapshot(self): return snapshot
+            def write(self, *args): raise AssertionError('Enrollment must not write to the panel')
+        module = SimpleNamespace(Bridge=Bridge, process=core.process, save=core.save)
+        spec = SimpleNamespace(loader=SimpleNamespace(exec_module=lambda module: None))
+        m.atomic(self.paths.state, json.dumps(state()))
+        with patch.object(m.importlib.util, 'spec_from_file_location', return_value=spec):
+            with patch.object(m.importlib.util, 'module_from_spec', return_value=module):
+                with patch.object(self.manager, 'initialize_unlocked',
+                                  side_effect=lambda policy: m.Manager.initialize_unlocked(self.manager, policy)):
+                    self.install()
+        current = json.loads(self.paths.state.read_text())
+        self.assertEqual(set(current['vms']), {'202'})
+        self.assertEqual(current['vms']['202']['limit'], 530000)
+        self.assertEqual(current['vms']['202']['used'], 170025)
+        self.assertEqual(current['vms']['202']['reserve'], 0)
+        self.assertEqual(current['vms']['202']['resets'], 0)
+
+    def test_failed_reenrollment_restores_leftovers_without_enabling_cron(self):
+        before = b'{"stale":true}'
+        m.atomic(self.paths.state, before)
+        m.atomic(self.paths.heartbeat, 'old heartbeat')
+        def fail(policy):
+            m.atomic(self.paths.state, '{"partial":true}')
+            raise RuntimeError('snapshot failed')
+        with patch.object(self.manager, 'initialize_unlocked', side_effect=fail):
+            with self.assertRaisesRegex(RuntimeError, 'snapshot failed'):
+                self.install()
+        self.assertEqual(self.paths.state.read_bytes(), before)
+        self.assertEqual(self.paths.heartbeat.read_text(), 'old heartbeat')
+        self.assertFalse(self.paths.cron.exists())
+        self.assertFalse(self.manager.installed())
+
+    def test_upgrade_with_missing_state_does_not_create_a_new_baseline(self):
+        self.install()
+        self.paths.state.unlink()
+        with self.assertRaisesRegex(RuntimeError, 'accounting state is missing'):
+            self.install()
+        self.assertEqual(self.manager.initialized, 1)
+
+    def test_complete_uninstall_removes_directories_and_stale_scheduled_run_does_nothing(self):
+        self.install()
+        self.manager.backup()
+        self.manager.scheduled_run()
+        self.manager.uninstall()
+        for path in (self.paths.app, self.paths.data, self.paths.command, self.paths.alias,
+                     self.paths.cron, self.paths.rotate, self.paths.log):
+            self.assertFalse(path.exists(), str(path))
+        self.assertEqual(self.manager.scheduled_run(), 0)
+        self.assertFalse(self.paths.data.exists())
+
+    def test_uninstall_also_cleans_old_version_leftovers_without_an_application(self):
+        m.atomic(self.paths.state, '{broken but removable}')
+        m.atomic(self.paths.data/'backups/backup-old.tar.gz', 'old archive')
+        m.atomic(Path(str(self.paths.log)+'.7.gz'), 'legacy log')
+        self.manager.uninstall()
+        self.assertFalse(self.paths.data.exists())
+        self.assertEqual(self.manager.log_archives(), [])
+
+    def test_uninstall_rejects_removal_outside_the_exact_private_directory(self):
+        self.install()
+        outside = self.root/'unrelated-data'
+        outside.mkdir()
+        marker = outside/'keep.txt'
+        marker.write_text('keep')
+        self.paths.data = outside
+        with self.assertRaisesRegex(RuntimeError, 'unexpected removal target'):
+            self.manager.uninstall()
+        self.assertEqual(marker.read_text(), 'keep')
+        self.assertTrue(self.paths.cron.exists())
+
+    def test_backups_are_limited_to_five_recent_archives(self):
+        self.install()
+        for _ in range(9):
+            self.manager.backup()
+        files = list((self.paths.data/'backups').glob('backup-*.tar.gz'))
+        self.assertEqual(len(files), 5)
+        for file in files:
+            with tarfile.open(file) as archive:
+                self.assertIn('data/state.json', archive.getnames())
+
+    def test_scheduled_run_removes_expired_and_legacy_backups(self):
+        self.install()
+        archive = self.manager.backup()
+        legacy = self.paths.data/'backup-123.json'
+        legacy.write_text('legacy')
+        old = m.time.time() - 8*m.DAY
+        for file in (archive, legacy):
+            os.utime(file, (old, old))
+        self.manager.scheduled_run()
+        self.assertFalse(archive.exists())
+        self.assertFalse(legacy.exists())
+
+    def test_log_stream_bounds_large_writes_and_preserves_utf8(self):
+        original = ('ترافیک\n'*40).encode('utf-8')
+        with patch.object(m, 'LOG_BYTES', 32):
+            stream = m.BoundedLog(self.paths.log)
+            stream.write(original.decode('utf-8'))
+            stream.close()
+        files = [Path(str(self.paths.log)+'.'+str(i)) for i in range(3, 0, -1)]
+        files += [self.paths.log]
+        retained = b''.join(file.read_bytes() for file in files if file.exists())
+        self.assertTrue(original.endswith(retained))
+        self.assertLessEqual(len(retained), 4*32)
+        for file in files:
+            self.assertLessEqual(file.stat().st_size, 32)
+            file.read_bytes().decode('utf-8')
+
+    def test_log_rotates_on_a_new_day_even_if_small(self):
+        m.atomic(self.paths.log, 'previous day')
+        old = m.time.time()-2*m.DAY
+        os.utime(self.paths.log, (old, old))
+        stream = m.BoundedLog(self.paths.log)
+        stream.write('today')
+        stream.close()
+        self.assertEqual(self.paths.log.read_text(), 'today')
+        self.assertEqual(Path(str(self.paths.log)+'.1').read_text(), 'previous day')
+
+    def test_expired_active_log_is_discarded(self):
+        m.atomic(self.paths.log, 'expired')
+        old = m.time.time()-8*m.DAY
+        os.utime(self.paths.log, (old, old))
+        stream = m.BoundedLog(self.paths.log)
+        stream.write('recent')
+        stream.close()
+        self.assertEqual(self.paths.log.read_text(), 'recent')
+        self.assertEqual(self.manager.log_archives(), [])
+
+    def test_log_pruning_limits_legacy_archives_and_keeps_other_app_logs(self):
+        for i in range(1, 8):
+            m.atomic(Path(str(self.paths.log)+'.'+str(i)+'.gz'), 'archive')
+        unrelated = self.paths.log.parent/'virtualizor.log'
+        unrelated.write_text('keep')
+        expired = Path(str(self.paths.log)+'-20200101.gz')
+        expired.write_text('expired')
+        old = m.time.time()-8*m.DAY
+        os.utime(expired, (old, old))
+        self.manager.prune_logs()
+        self.assertEqual(len(self.manager.log_archives()), 3)
+        self.assertFalse(expired.exists())
+        self.assertEqual(unrelated.read_text(), 'keep')
+
+    def test_scheduled_failure_captures_output_and_restores_terminal_streams(self):
+        self.install()
+        before_stdout, before_stderr = m.sys.stdout, m.sys.stderr
+        result = subprocess.CompletedProcess([], 1, stdout='panel issue\n', stderr='error detail\n')
+        with patch.object(self.manager, 'core_command', return_value=result):
+            self.assertEqual(self.manager.scheduled_run(), 1)
+        content = self.paths.log.read_text()
+        self.assertIn('panel issue', content)
+        self.assertIn('error detail', content)
+        self.assertIn('RUN_FAILED', content)
+        self.assertIs(m.sys.stdout, before_stdout)
+        self.assertIs(m.sys.stderr, before_stderr)
+        self.assertEqual(json.loads(self.paths.heartbeat.read_text())['exit_code'], 1)
+        self.assertNotIn('>>', self.paths.cron.read_text())
+        self.assertFalse(self.paths.rotate.exists())
+
+    def test_actual_cron_cli_uses_bounded_logging_entrypoint(self):
+        self.install()
+        with patch.object(m.sys, 'argv', ['kvm-bw', 'scheduled-run']):
+            with patch.object(m.sys, 'platform', 'linux'):
+                with patch.object(m.os, 'geteuid', return_value=0, create=True):
+                    with patch.object(m, 'Manager', return_value=self.manager):
+                        self.assertEqual(m.main(), 0)
+        self.assertIn('RUN_OK', self.paths.log.read_text())
+        self.assertEqual(self.manager.calls, [('run',)])
 
 
 class HostCompatibilityTests(unittest.TestCase):

@@ -1,5 +1,7 @@
 # KVM Bandwidth Carryover
 
+**v2.2.0 · AlmaLinux / Ubuntu**
+
 <p dir="rtl">اسکریپتی برای مدیریت ماندهٔ ترافیک <strong>VPSهای KVM در پنل Virtualizor</strong>. بعد از ریست‌شدن مصرف، سقف ترافیک را به حجم باقی‌ماندهٔ مشتری تغییر می‌دهد تا سهمیهٔ کامل قبلی دوباره شارژ نشود.</p>
 
 A bandwidth carry-over tool for **KVM VPSs managed by Virtualizor**. After a usage reset, it replaces the traffic quota with the customer's remaining allowance instead of granting the full quota again.
@@ -36,7 +38,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/mmdkevin/kvm-bandwidth-carry
 
 </div>
 
-نصب اول فقط مصرف و سقف فعلی را ثبت می‌کند؛ سهمیه را تغییر نمی‌دهد. بررسی خودکار از همان نصب **هر دقیقه روشن است** و با بستن SSH متوقف نمی‌شود. ارتقا، سابقه و وضعیت روشن یا خاموش زمان‌بندی را حفظ می‌کند.
+نصب اول یا **نصب دوباره پس از حذف** فقط مصرف و سقف فعلی پنل را ثبت می‌کند؛ دادهٔ باقی‌مانده از نصب قدیمی ملاک نیست و سهمیه تغییر نمی‌کند. بررسی خودکار **هر دقیقه روشن است** و با بستن SSH متوقف نمی‌شود. اگر برنامه هنوز نصب باشد، گزینهٔ نصب/ارتقا، **ارتقا** محسوب می‌شود و سابقه و وضعیت زمان‌بندی را حفظ می‌کند.
 
 | دستور | کاربرد |
 |---|---|
@@ -47,7 +49,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/mmdkevin/kvm-bandwidth-carry
 | `kvm-bw start` / `kvm-bw stop` | روشن یا متوقف‌کردن بررسی خودکار |
 | `kvm-bw logs` / `kvm-bw doctor` | گزارش عملیات و بررسی سلامت برنامه |
 | `kvm-bw backup` / `kvm-bw upgrade` | پشتیبان‌گیری یا ارتقای برنامه |
-| `kvm-bw uninstall` | حذف برنامه؛ داده‌های حسابداری و سقف‌های فعلی حفظ می‌شوند |
+| `kvm-bw uninstall` | حذف کامل برنامه، کرون، سابقه، لاگ و پشتیبان‌های خودش |
 | `kvm-bw commands` | فهرست کامل دستورات |
 
 ### سؤال‌های مهم
@@ -57,6 +59,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/mmdkevin/kvm-bandwidth-carry
 - **VPS جدید اضافه می‌شود؟** بله؛ KVM محلی با سقف محدود و عدد صحیح، در بررسی موفق بعدی خودکار ثبت می‌شود. سقف صفر یعنی نامحدود و برای VPS جدید ثبت نمی‌شود.
 - **تیک Service period bandwidth calculation مهم است؟** هر دو حالت قابل‌استفاده‌اند؛ تشخیص با کاهش مصرف است. تغییر این تنظیم هم اگر مصرف را پایین بیاورد، ریست حساب می‌شود.
 - **وقتی حجم تمام شد چه می‌شود؟** برنامه خودش VPS را قطع نمی‌کند و `Bandwidth suspend` را روشن نمی‌کند. برای ماندهٔ زیر یک گیگ، پیش‌فرض سقف **یک گیگ** است و اختلاف برای محاسبهٔ بعد ذخیره می‌شود؛ پس قطع دقیق در اعتبار صفر ندارد. سقف صفر نمی‌نویسد، چون در پنل یعنی نامحدود.
+
+### نگهداری داده‌ها و حذف
+
+- **لاگ:** یک فایل فعال و حداکثر ۳ آرشیو، هرکدام تا ۵ مگابایت؛ مجموع تا ۲۰ مگابایت و حداکثر عمر ۷ روز. چرخش در شروع روز جدید یا پرشدن فایل انجام می‌شود.
+- **پشتیبان:** حداکثر ۵ فایل، با عمر حداکثر ۷ روز.
+- **دادهٔ مصرف:** آخرین وضعیت و یک نسخهٔ قبلی نگهداری می‌شود؛ برای هر دقیقه تاریخچه اضافه نمی‌شود. سابقهٔ VPSی که ۳۰ روز در فهرست محلی پنل نباشد پاک می‌شود.
+
+پاک‌سازی در بررسی‌های برنامه و هنگام نصب/ارتقا انجام می‌شود؛ هنگام توقف بررسی‌ها فایل جدیدی تولید نمی‌شود. **Uninstall همهٔ داده‌های خود برنامه را پاک می‌کند**؛ سقف و مصرف VPSها و کرون‌های Virtualizor تغییر نمی‌کنند. پشتیبانی که خودتان به محل دیگری کپی کرده‌اید، پاک نمی‌شود.
 
 ### محدودیت‌های ضروری
 
@@ -90,7 +100,7 @@ Run as `root` on the main host, then choose **1 — Install / Upgrade**:
 bash <(curl -fsSL https://raw.githubusercontent.com/mmdkevin/kvm-bandwidth-carryover/main/install.sh)
 ```
 
-Initial enrollment saves current usage and quota without editing quotas. Fresh installation **enables checks every minute**; closing SSH does not stop them. Upgrades preserve accounting history and the enabled/paused schedule.
+First installation or **reinstallation after removal** records current panel usage and quotas without editing them. Leftover accounting data from an older removal is ignored. Checks are **enabled every minute** and continue after SSH closes. If the application is still installed, Install / Upgrade is an **upgrade** and preserves accounting history and the enabled/paused schedule.
 
 | Command | Purpose |
 |---|---|
@@ -101,7 +111,7 @@ Initial enrollment saves current usage and quota without editing quotas. Fresh i
 | `kvm-bw start` / `kvm-bw stop` | Enable or pause automatic checks |
 | `kvm-bw logs` / `kvm-bw doctor` | Operation log and health checks |
 | `kvm-bw backup` / `kvm-bw upgrade` | Create a backup or upgrade |
-| `kvm-bw uninstall` | Remove the application; retain accounting data and current panel quotas |
+| `kvm-bw uninstall` | Remove the application, its Cron, accounting data, logs, and backups |
 | `kvm-bw commands` | Complete command reference |
 
 ### Common questions
@@ -111,6 +121,14 @@ Initial enrollment saves current usage and quota without editing quotas. Fresh i
 - **Are new VPSs enrolled?** Yes, at a later successful check, for local KVM guests with a finite whole-GB quota. New guests with a zero/unlimited quota are skipped.
 - **Does Service period bandwidth calculation need to be enabled?** Either setting works. Detection uses a usage decrease; changing the setting can also trigger correction if usage drops.
 - **What happens when credit runs out?** The tool does not suspend VPSs or enable `Bandwidth suspend`. Below 1 GB, the default policy writes a **1 GB** quota and records the difference for later calculations. It is not a strict zero-credit cutoff. It never writes zero as depleted credit, because zero means unlimited in the panel.
+
+### Storage and removal
+
+- **Logs:** one active file plus up to 3 archives, each at most 5 MiB; up to 20 MiB total and a maximum age of 7 days. Rotate at a new UTC day or when full.
+- **Backups:** up to 5 files, each retained for at most 7 days.
+- **Accounting:** the latest state and one previous snapshot, not a new historical row each minute. Forget guests absent from the local panel list for 30 days.
+
+Cleanup runs with accounting checks and installation/upgrades. Paused checks do not generate new log files. **Uninstall removes all data owned by this application**, leaving panel quotas, usage, and Virtualizor jobs unchanged. Copies of backups stored elsewhere are not removed.
 
 ### Essential limitations
 

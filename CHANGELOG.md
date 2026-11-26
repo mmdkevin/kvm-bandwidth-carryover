@@ -1,3 +1,13 @@
+# v2.2.0
+
+- Reinstallation after removal enrolls current panel values and ignores leftover accounting data.
+- Upgrades of an existing installation preserve the current ledger and enabled/paused schedule.
+- Uninstall removes all owned application files, Cron, accounting data, logs and backups; panel values remain unchanged.
+- Rotate scheduled-run logs internally at 5 MiB or a new UTC day; keep 3 archives for at most 7 days.
+- Limit backups to 5 files and 7 days; remove accounting rows after 30 days of confirmed absence.
+- Remove the external logrotate job and dependency; bounded logging captures scheduled output and errors.
+- Add lifecycle, retention, log-size, UTF-8, failure rollback and safe removal regression tests.
+
 # v2.1.0
 
 - Add Ubuntu host compatibility: detect cron/crond using distribution metadata and active services.
