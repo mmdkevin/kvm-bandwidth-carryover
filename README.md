@@ -1,6 +1,6 @@
 # KVM Bandwidth Carryover
 
-**v2.2.0 · AlmaLinux / Ubuntu**
+**v2.2.1 · AlmaLinux / Ubuntu**
 
 <p dir="rtl">اسکریپتی برای مدیریت ماندهٔ ترافیک <strong>VPSهای KVM در پنل Virtualizor</strong>. بعد از ریست‌شدن مصرف، سقف ترافیک را به حجم باقی‌ماندهٔ مشتری تغییر می‌دهد تا سهمیهٔ کامل قبلی دوباره شارژ نشود.</p>
 
@@ -64,7 +64,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/mmdkevin/kvm-bandwidth-carry
 
 - **لاگ:** یک فایل فعال و حداکثر ۳ آرشیو، هرکدام تا ۵ مگابایت؛ مجموع تا ۲۰ مگابایت و حداکثر عمر ۷ روز. چرخش در شروع روز جدید یا پرشدن فایل انجام می‌شود.
 - **پشتیبان:** حداکثر ۵ فایل، با عمر حداکثر ۷ روز.
-- **دادهٔ مصرف:** آخرین وضعیت و یک نسخهٔ قبلی نگهداری می‌شود؛ برای هر دقیقه تاریخچه اضافه نمی‌شود. سابقهٔ VPSی که ۳۰ روز در فهرست محلی پنل نباشد پاک می‌شود.
+- **دادهٔ مصرف:** آخرین وضعیت و یک نسخهٔ قبلی نگهداری می‌شود؛ برای هر دقیقه تاریخچه اضافه نمی‌شود. سابقهٔ VPSی که ۷ روز از اولین تشخیص غیبتش در فهرست محلی پنل گذشته باشد، در بررسی بعدی پاک می‌شود.
 
 پاک‌سازی در بررسی‌های برنامه و هنگام نصب/ارتقا انجام می‌شود؛ هنگام توقف بررسی‌ها فایل جدیدی تولید نمی‌شود. **Uninstall همهٔ داده‌های خود برنامه را پاک می‌کند**؛ سقف و مصرف VPSها و کرون‌های Virtualizor تغییر نمی‌کنند. پشتیبانی که خودتان به محل دیگری کپی کرده‌اید، پاک نمی‌شود.
 
@@ -126,7 +126,7 @@ First installation or **reinstallation after removal** records current panel usa
 
 - **Logs:** one active file plus up to 3 archives, each at most 5 MiB; up to 20 MiB total and a maximum age of 7 days. Rotate at a new UTC day or when full.
 - **Backups:** up to 5 files, each retained for at most 7 days.
-- **Accounting:** the latest state and one previous snapshot, not a new historical row each minute. Forget guests absent from the local panel list for 30 days.
+- **Accounting:** the latest state and one previous snapshot, not a new historical row each minute. Forget absent guests on the first check at least 7 days after their absence was first detected in the local panel list.
 
 Cleanup runs with accounting checks and installation/upgrades. Paused checks do not generate new log files. **Uninstall removes all data owned by this application**, leaving panel quotas, usage, and Virtualizor jobs unchanged. Copies of backups stored elsewhere are not removed.
 

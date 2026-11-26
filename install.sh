@@ -44,7 +44,7 @@ import time
 STATE_DIR = Path('/var/lib/reset-carryover')
 PHP = '/usr/local/emps/bin/php'
 BRIDGE = '/opt/reset-carryover/bridge.php'
-ABSENT_RETENTION = 30 * 86400
+ABSENT_RETENTION = 7 * 86400
 
 
 def amount(value):
@@ -390,7 +390,7 @@ import tempfile
 import time
 import urllib.request
 
-VERSION = '2.2.0'
+VERSION = '2.2.1'
 DAY = 86400
 LOG_BYTES = 5 * 1024 * 1024
 LOG_ARCHIVES = 3
@@ -1470,15 +1470,16 @@ class ResetTests(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text())['value'], 2)
             self.assertEqual(json.loads(path.with_suffix('.previous.json').read_text())['value'], 1)
 
-    def test_missing_guest_is_retained_for_thirty_days_then_forgotten(self):
+    def test_missing_guest_is_retained_for_seven_days_then_forgotten(self):
         state = self.state()
         saved = []
         bridge = FakeBridge(saved)
-        for now in (1000, 1000+r.ABSENT_RETENTION-1):
+        retention = 7 * 86400
+        for now in (1000, 1000+retention-1):
             r.process(state, dict(now=now, vms=[]), bridge,
                       lambda value: saved.append(copy.deepcopy(value)))
             self.assertIn('101', state['vms'])
-        r.process(state, dict(now=1000+r.ABSENT_RETENTION, vms=[]), bridge,
+        r.process(state, dict(now=1000+retention, vms=[]), bridge,
                   lambda value: saved.append(copy.deepcopy(value)))
         self.assertNotIn('101', state['vms'])
         self.assertEqual(bridge.writes, [])

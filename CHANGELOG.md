@@ -1,3 +1,9 @@
+# v2.2.1
+
+- Reduce absent VPS accounting retention from 30 days to 7 days, measured from the first detected absence.
+- Existing absence timestamps remain valid after upgrade; current guests are not expired.
+- Update the bilingual README and the deletion-boundary regression test.
+
 # v2.2.0
 
 - Reinstallation after removal enrolls current panel values and ignores leftover accounting data.
