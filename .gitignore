@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.log
+state*.json
+backup-*.json
+.env
+universal.php
