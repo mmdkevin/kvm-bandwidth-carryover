@@ -358,7 +358,7 @@ import tempfile
 import time
 import urllib.request
 
-VERSION = '2.0.0'
+VERSION = '2.0.1'
 SOURCE_URL = 'https://raw.githubusercontent.com/mmdkevin/kvm-bandwidth-carryover/main/install-reset-carryover.sh'
 ASSETS = ('reset_carryover.py', 'bridge.php', 'carryover_manager.py',
           'test_reset_carryover.py', 'test_carryover_manager.py')
@@ -420,6 +420,25 @@ def validated_state(path):
             if key not in s:
                 raise RuntimeError('Incomplete accounting record: '+key)
     return state
+
+
+@contextmanager
+def terminal_input():
+    """Read commands without requiring a terminal to support seek/update mode."""
+    owned = False
+    try:
+        stream = open('/dev/tty', 'r', encoding='utf-8', errors='replace')
+        owned = True
+    except OSError:
+        if sys.stdin is not None and sys.stdin.isatty():
+            stream = sys.stdin
+        else:
+            raise RuntimeError('No interactive terminal. Add an argument such as upgrade, install, status, or commands.') from None
+    try:
+        yield stream
+    finally:
+        if owned:
+            stream.close()
 
 
 class Manager:
@@ -823,10 +842,14 @@ class Manager:
             return subprocess.run(['bash', str(file), 'upgrade']).returncode
 
     def menu(self):
-        with open('/dev/tty', 'r+') as tty:
+        with terminal_input() as tty:
             def ask(prompt):
                 print(prompt, end='', flush=True)
-                return tty.readline().strip()
+                try:
+                    line = tty.readline()
+                except OSError:
+                    return None
+                return line.strip() if line else None
             while True:
                 print('\nKVM Bandwidth Carryover v'+VERSION+' | installed: '+self.installed_version())
                 print('1) Install / Upgrade\n2) Status\n3) Preview changes (read-only)\n4) Run one check')
@@ -834,7 +857,7 @@ class Manager:
                 print('9) Backup\n10) Commands\n11) Uninstall (keep accounting data)\n0) Exit')
                 choice = ask('Select: ')
                 try:
-                    if choice == '0':
+                    if choice is None or choice == '0':
                         return 0
                     actions = {'1': lambda: self.remote_upgrade() if self.source.resolve() == self.p.app.resolve() else self.install(),
                                '2': self.status, '3': self.preview, '4': self.run, '5': self.enable,
@@ -846,7 +869,8 @@ class Manager:
                         actions[choice]()
                 except Exception as e:
                     print('ERROR:', e)
-                if ask('\nEnter to continue, or q to exit: ').lower() == 'q':
+                next_choice = ask('\nEnter to continue, or q to exit: ')
+                if next_choice is None or next_choice.lower() == 'q':
                     return 0
 
 
@@ -901,10 +925,7 @@ def main():
     os.umask(0o077)
     manager = Manager(source=args.source)
     if command == 'menu':
-        try:
-            return manager.menu()
-        except OSError:
-            raise RuntimeError('No interactive terminal. Use install, upgrade, status, uninstall, or commands as an argument.')
+        return manager.menu()
     if command == 'install':
         manager.install(args.policy)
     elif command == 'upgrade':
@@ -1156,6 +1177,7 @@ cat > "$stage_dir/test_carryover_manager.py" <<'RC_MANAGER_TEST'
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tarfile
@@ -1455,6 +1477,55 @@ class ManagementTests(unittest.TestCase):
         self.assertFalse(self.paths.data.exists())
         self.assertFalse(self.paths.app.exists())
         self.assertEqual(self.manager.calls, [])
+
+    def test_menu_accepts_nonseekable_terminal_input(self):
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        os.write(write_fd, b'0\n')
+        os.close(write_fd)
+        def terminal(path, mode, **kwargs):
+            self.assertEqual(path, '/dev/tty')
+            if '+' in mode:
+                class NonSeekableTerminal(io.RawIOBase):
+                    def readable(self): return True
+                    def writable(self): return True
+                    def seekable(self): return False
+                # Reproduce Python's buffered update mode on a non-seekable TTY.
+                return io.TextIOWrapper(io.BufferedRandom(NonSeekableTerminal()))
+            return os.fdopen(os.dup(read_fd), mode, **kwargs)
+        with patch.object(m, 'open', side_effect=terminal, create=True):
+            self.assertEqual(self.manager.menu(), 0)
+        self.assertFalse(self.paths.data.exists())
+
+    def test_menu_falls_back_to_tty_stdin_without_closing_it(self):
+        class Terminal(io.StringIO):
+            def isatty(self): return True
+        stream = Terminal('0\n')
+        with patch.object(m, 'open', side_effect=OSError('tty unavailable'), create=True):
+            with patch.object(m.sys, 'stdin', stream):
+                self.assertEqual(self.manager.menu(), 0)
+        self.assertFalse(stream.closed)
+
+    def test_menu_without_any_terminal_requests_noninteractive_command(self):
+        stream = io.StringIO('installer stream must not be read')
+        with patch.object(m, 'open', side_effect=OSError('no tty'), create=True):
+            with patch.object(m.sys, 'stdin', stream):
+                with self.assertRaisesRegex(RuntimeError, 'upgrade'):
+                    self.manager.menu()
+        self.assertEqual(stream.tell(), 0)
+        self.assertFalse(self.paths.data.exists())
+
+    def test_menu_exits_on_eof_instead_of_looping(self):
+        with patch.object(m, 'open', return_value=io.StringIO(''), create=True):
+            self.assertEqual(self.manager.menu(), 0)
+        self.assertFalse(self.paths.data.exists())
+
+    def test_menu_commands_and_quit_do_not_modify_state(self):
+        self.install()
+        before = self.paths.state.read_bytes()
+        with patch.object(m, 'open', return_value=io.StringIO('10\nq\n'), create=True):
+            self.assertEqual(self.manager.menu(), 0)
+        self.assertEqual(self.paths.state.read_bytes(), before)
 
 
 if __name__ == '__main__':
