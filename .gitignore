@@ -2,6 +2,6 @@ __pycache__/
 *.pyc
 *.log
 state*.json
-backup-*.json
+backup-*
 .env
 universal.php

@@ -1,45 +1,23 @@
 #!/usr/bin/env bash
+# KVM_BW_MANAGER_BOOTSTRAP_V2
 set -euo pipefail
 umask 077
-if [[ $EUID -ne 0 ]]; then echo 'Run as root.' >&2; exit 1; fi
-policy=minimum-1gb
-if [[ $# -gt 1 ]]; then echo 'Usage: bash install-reset-carryover.sh [--hold-under-one-gb]' >&2; exit 1; fi
-if [[ $# -eq 1 ]]; then
+command -v python3 >/dev/null || { echo 'Python 3.9 or later is required.' >&2; exit 1; }
+stage_dir="$(mktemp -d /tmp/kvm-bw.XXXXXX)"
+cleanup() {
+    for filename in reset_carryover.py bridge.php carryover_manager.py test_reset_carryover.py test_carryover_manager.py; do
+        rm -f -- "$stage_dir/$filename"
+    done
+    rmdir -- "$stage_dir" 2>/dev/null || true
+}
+trap cleanup EXIT
+if [[ $# -gt 0 ]]; then
     case "$1" in
-      --hold-under-one-gb) policy=hold ;;
-      --minimum-one-gb) policy=minimum-1gb ;;
-      *) echo 'Unknown option.' >&2; exit 1 ;;
+      --minimum-one-gb) shift; set -- install --policy minimum-1gb "$@" ;;
+      --hold-under-one-gb) shift; set -- install --policy hold "$@" ;;
     esac
 fi
-for dependency in python3 timeout install; do
-    command -v "$dependency" >/dev/null || { echo "Missing command: $dependency" >&2; exit 1; }
-done
-test -x /usr/bin/python3
-test -x /usr/local/emps/bin/php
-test -r /usr/local/virtualizor/universal.php
-test -r /usr/local/virtualizor/sdk/admin.php
-/usr/bin/python3 -c 'import fcntl, json, decimal'
-if command -v systemctl >/dev/null; then
-    if systemctl is-active --quiet vps-credit.timer; then
-        echo 'Older network-control version is active. Run vps-credit disable first.' >&2
-        exit 1
-    fi
-    if ! systemctl is-active --quiet crond; then
-        echo 'crond is not active. No changes installed.' >&2
-        exit 1
-    fi
-fi
-if [[ -e /etc/cron.d/native-carryover ]]; then
-    echo 'Older experimental native-carryover Cron is still present. Disable it before installing this version.' >&2
-    exit 1
-fi
-if [[ -e /var/lib/reset-carryover/state.json || -e /etc/cron.d/reset-carryover ]]; then
-    echo 'Already installed or initialized. History preserved; no files overwritten.' >&2
-    echo 'Use reset-carryover status. Do not delete the saved state.' >&2
-    exit 1
-fi
-install -d -m 0700 /opt/reset-carryover /var/lib/reset-carryover
-cat > '/opt/reset-carryover/reset_carryover.py' <<'RC_PYTHON'
+cat > "$stage_dir/reset_carryover.py" <<'RC_CORE'
 #!/usr/bin/env python3
 """All counter decreases are resets. Only the panel quota may be edited."""
 import argparse
@@ -286,8 +264,8 @@ if __name__ == '__main__':
         print('ERROR:', str(e), file=sys.stderr)
         sys.exit(1)
 
-RC_PYTHON
-cat > '/opt/reset-carryover/bridge.php' <<'RC_PHP'
+RC_CORE
+cat > "$stage_dir/bridge.php" <<'RC_BRIDGE'
 <?php
 ini_set('display_errors','0');
 error_reporting(0);
@@ -361,13 +339,621 @@ try {
     fwrite(STDERR,'BRIDGE_ERROR: '.$code."\n");exit(1);
 }
 
-RC_PHP
-cat > '/opt/reset-carryover/test_reset_carryover.py' <<'RC_TESTS'
+RC_BRIDGE
+cat > "$stage_dir/carryover_manager.py" <<'RC_MANAGER'
+#!/usr/bin/env python3
+"""KVM Bandwidth Carryover management commands. Accounting data survives uninstall."""
+import argparse
+from collections import deque
+from contextlib import contextmanager
+from datetime import datetime
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+
+VERSION = '2.0.0'
+SOURCE_URL = 'https://raw.githubusercontent.com/mmdkevin/kvm-bandwidth-carryover/main/install-reset-carryover.sh'
+ASSETS = ('reset_carryover.py', 'bridge.php', 'carryover_manager.py',
+          'test_reset_carryover.py', 'test_carryover_manager.py')
+CRON = ('SHELL=/bin/bash\n'
+        'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n'
+        '* * * * * root timeout 55s /usr/local/sbin/reset-carryover scheduled-run '
+        '>> /var/log/reset-carryover.log 2>&1\n')
+WRAPPER = ('#!/usr/bin/env bash\nset -euo pipefail\numask 077\n'
+           'exec /usr/bin/python3 /opt/reset-carryover/carryover_manager.py "$@"\n')
+ROTATE = ('/var/log/reset-carryover.log {\n    size 5M\n    rotate 7\n'
+          '    compress\n    missingok\n    notifempty\n    create 0600 root root\n}\n')
+
+
+class Paths:
+    def __init__(self, root=None):
+        self.root = Path(root) if root is not None else Path('/')
+        self.app = self.root/'opt/reset-carryover'
+        self.data = self.root/'var/lib/reset-carryover'
+        self.state = self.data/'state.json'
+        self.paused = self.data/'paused'
+        self.heartbeat = self.data/'last-run.json'
+        self.cron = self.root/'etc/cron.d/reset-carryover'
+        self.rotate = self.root/'etc/logrotate.d/reset-carryover'
+        self.log = self.root/'var/log/reset-carryover.log'
+        self.command = self.root/'usr/local/sbin/reset-carryover'
+        self.alias = self.root/'usr/local/sbin/kvm-bw'
+        self.php = self.root/'usr/local/emps/bin/php'
+        self.sdk = self.root/'usr/local/virtualizor/sdk/admin.php'
+        self.universal = self.root/'usr/local/virtualizor/universal.php'
+
+
+def atomic(path, data, mode=0o600):
+    path = Path(path)
+    if path.is_symlink():
+        raise RuntimeError('Refusing symlink: '+str(path))
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    raw = data.encode() if isinstance(data, str) else data
+    fd, tmp = tempfile.mkstemp(prefix='.kvm-bw-', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def validated_state(path):
+    state = json.loads(Path(path).read_text())
+    if state.get('version') != 2 or state.get('policy') not in ('minimum-1gb', 'hold'):
+        raise RuntimeError('Unsupported accounting data; refusing to reinitialize it')
+    if not isinstance(state.get('vms'), dict):
+        raise RuntimeError('Invalid saved VPS data')
+    for s in state['vms'].values():
+        for key in ('name', 'uuid', 'limit', 'used', 'at', 'reserve', 'hold', 'pending', 'resets'):
+            if key not in s:
+                raise RuntimeError('Incomplete accounting record: '+key)
+    return state
+
+
+class Manager:
+    def __init__(self, paths=None, source=None):
+        self.p = paths or Paths()
+        self.source = Path(source or Path(__file__).resolve().parent)
+
+    def guard_directories(self):
+        for path in (self.p.app, self.p.data):
+            if path.is_symlink():
+                raise RuntimeError('Managed directory must not be a symlink: '+str(path))
+        self.p.data.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    @contextmanager
+    def locked(self, core=False, nonblocking=False):
+        self.guard_directories()
+        handles = []
+        try:
+            for name in ('operation.lock', 'lock') if core else ('operation.lock',):
+                f = (self.p.data/name).open('a')
+                handles.append(f)
+                if os.name != 'nt':
+                    import fcntl
+                    flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0)
+                    fcntl.flock(f, flags)
+            yield
+        finally:
+            for f in reversed(handles):
+                f.close()
+
+    def installed(self):
+        return (self.p.app/'reset_carryover.py').is_file()
+
+    def enabled(self):
+        return self.p.cron.is_file() and not self.p.paused.exists()
+
+    def installed_version(self):
+        version = self.p.app/'VERSION'
+        return version.read_text().strip() if version.is_file() else ('legacy' if self.installed() else 'not installed')
+
+    def heartbeat(self):
+        if not self.p.heartbeat.exists():
+            return None
+        try:
+            value = json.loads(self.p.heartbeat.read_text())
+            if not isinstance(value, dict):
+                raise ValueError('not an object')
+            return value
+        except (OSError, ValueError):
+            return {'last_success': None, 'metadata_error': 'Run metadata is unreadable; the next check will rebuild it'}
+
+    def _backup(self):
+        folder = self.p.data/'backups'
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        archive = folder/('backup-'+datetime.now().strftime('%Y%m%d-%H%M%S-')+str(time.time_ns())+'.tar.gz')
+        selected = [(self.p.state, 'data/state.json'),
+                    (self.p.data/'state.previous.json', 'data/state.previous.json'),
+                    (self.p.heartbeat, 'data/last-run.json'),
+                    (self.p.paused, 'data/paused'), (self.p.cron, 'config/cron'),
+                    (self.p.command, 'config/reset-carryover'), (self.p.alias, 'config/kvm-bw')]
+        selected += [(self.p.app/name, 'app/'+name) for name in (*ASSETS, 'VERSION')]
+        with tarfile.open(archive, 'w:gz') as tar:
+            for file, name in selected:
+                if file.is_file() and not file.is_symlink():
+                    tar.add(file, arcname=name, recursive=False)
+        os.chmod(archive, 0o600)
+        return archive
+
+    def backup(self):
+        with self.locked(core=True):
+            if not self.p.state.exists():
+                raise RuntimeError('No accounting data exists')
+            validated_state(self.p.state)
+            path = self._backup()
+        print('Backup:', path)
+        return path
+
+    def validate_source(self):
+        for name in ASSETS:
+            if not (self.source/name).is_file():
+                raise RuntimeError('Incomplete package: '+name)
+            if name.endswith('.py'):
+                compile((self.source/name).read_text(encoding='utf-8'), name, 'exec')
+        result = subprocess.run([str(self.p.php), '-l', str(self.source/'bridge.php')],
+                                capture_output=True, text=True, timeout=15)
+        if result.returncode:
+            raise RuntimeError('PHP syntax validation failed')
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
+        result = subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s',
+                                 str(self.source), '-p', 'test_*.py', '-q'],
+                                env=env, capture_output=True, text=True, timeout=90)
+        if result.returncode:
+            raise RuntimeError('Package tests failed:\n'+result.stdout[-2000:]+result.stderr[-2000:])
+        print('Package syntax and isolated tests: PASS')
+
+    def preflight(self):
+        if sys.version_info < (3, 9):
+            raise RuntimeError('Python 3.9 or later is required')
+        for file in (self.p.php, self.p.sdk, self.p.universal):
+            if not file.is_file():
+                raise RuntimeError('Required file is missing: '+str(file))
+        old_cron = self.p.root/'etc/cron.d/native-carryover'
+        if old_cron.exists():
+            raise RuntimeError('Disable the old native-carryover Cron first; its data will not be removed')
+        if subprocess.run(['systemctl', 'is-active', '--quiet', 'vps-credit.timer'],
+                          capture_output=True).returncode == 0:
+            raise RuntimeError('Old network-control version is active. Run: vps-credit disable')
+        if subprocess.run(['systemctl', 'is-active', '--quiet', 'crond'],
+                          capture_output=True).returncode != 0:
+            raise RuntimeError('crond is not active; start it before enabling automatic checks')
+
+    def core_command(self, *args):
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
+        return subprocess.run([sys.executable, str(self.p.app/'reset_carryover.py'), *args],
+                              env=env, capture_output=True, text=True, timeout=120)
+
+    def _schedule(self, enabled):
+        if enabled:
+            self.p.log.parent.mkdir(parents=True, exist_ok=True)
+            self.p.log.touch(mode=0o600, exist_ok=True)
+            atomic(self.p.cron, CRON, 0o644)
+            if self.p.paused.exists():
+                self.p.paused.unlink()
+        else:
+            atomic(self.p.paused, 'Automatic checks are paused.\n')
+            if self.p.cron.exists():
+                self.p.cron.unlink()
+
+    def install(self, policy=None):
+        self.guard_directories()
+        self.preflight()
+        self.validate_source()  # No installed files are replaced before validation.
+        with self.locked(core=True):
+            existing = self.installed()
+            was_enabled = self.enabled()
+            old_state = self.p.state.read_bytes() if self.p.state.exists() else None
+            if old_state is not None:
+                old_saved = validated_state(self.p.state)
+                if policy is not None and policy != old_saved['policy']:
+                    raise RuntimeError('Upgrade preserves the current policy. Use: kvm-bw policy '+policy)
+            backup = self._backup() if existing or old_state is not None else None
+            files = [self.p.app/name for name in (*ASSETS, 'VERSION')]
+            files += [self.p.command, self.p.alias, self.p.cron, self.p.rotate, self.p.paused]
+            previous = {file: (file.read_bytes(), file.stat().st_mode & 0o777)
+                        if file.is_file() and not file.is_symlink() else None for file in files}
+            try:
+                self.p.app.mkdir(mode=0o700, parents=True, exist_ok=True)
+                for name in ASSETS:
+                    atomic(self.p.app/name, (self.source/name).read_bytes())
+                atomic(self.p.app/'VERSION', VERSION+'\n')
+                atomic(self.p.command, WRAPPER, 0o700)
+                atomic(self.p.alias, WRAPPER, 0o700)
+                if old_state is None:
+                    # Initialize in this process while both locks remain held.
+                    # Do not start a subprocess that would re-lock the ledger.
+                    self.initialize_unlocked(policy or 'minimum-1gb')
+                elif self.p.state.read_bytes() != old_state:
+                    raise RuntimeError('Accounting data changed unexpectedly during upgrade')
+                atomic(self.p.rotate, ROTATE, 0o644)
+                self._schedule(was_enabled if existing else True)
+            except Exception:
+                for file, contents in previous.items():
+                    if contents is None:
+                        if file.is_file() and not file.is_symlink():
+                            file.unlink()
+                    else:
+                        atomic(file, contents[0], contents[1])
+                raise
+        print(('UPGRADED' if existing else 'INSTALLED')+' v'+VERSION)
+        print('Accounting history preserved.' if old_state is not None else 'Current panel usage saved as the initial baseline.')
+        print('Automatic checks:', 'enabled (every minute)' if self.enabled() else 'paused')
+        if backup:
+            print('Pre-upgrade backup:', backup)
+
+    def initialize_unlocked(self, policy):
+        # Fresh initialization in this process avoids re-locking from a subprocess.
+        spec = importlib.util.spec_from_file_location('_kvm_bw_install_core', self.p.app/'reset_carryover.py')
+        core = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(core)
+        core.BRIDGE = str(self.p.app/'bridge.php')
+        core.PHP = str(self.p.php)
+        bridge = core.Bridge()
+        snapshot = bridge.snapshot()
+        state = dict(version=2, policy=policy, vms={})
+        problems = core.process(state, snapshot, bridge, lambda s: core.save(self.p.state, s))
+        if problems or not state['vms']:
+            raise RuntimeError('Initial enrollment failed; accounting data retained, Cron not enabled')
+
+    def pause(self):
+        self.guard_directories()
+        # Stop new scheduled checks before waiting for an in-flight worker.
+        atomic(self.p.paused, 'Automatic checks are paused.\n')
+        with self.locked(core=True):
+            self._schedule(False)
+        print('Automatic checks paused. Quotas and accounting history unchanged.')
+
+    def enable(self):
+        if not self.installed() or not self.p.state.exists():
+            raise RuntimeError('Install the application first')
+        self.preflight()
+        with self.locked(core=True):
+            validated_state(self.p.state)
+            self._schedule(True)
+        print('Automatic checks enabled: every minute.')
+
+    def run(self, scheduled=False):
+        if scheduled and (self.p.paused.exists() or not self.p.cron.exists()):
+            return 0
+        try:
+            with self.locked(nonblocking=True):
+                if scheduled and self.p.paused.exists():
+                    return 0
+                if not self.installed() or not self.p.state.exists():
+                    raise RuntimeError('Not installed or accounting state missing')
+                started = time.time()
+                try:
+                    result = self.core_command('run')
+                    if result.stdout:
+                        print(result.stdout, end='')
+                    if result.stderr:
+                        print(result.stderr, end='', file=sys.stderr)
+                    code = result.returncode
+                    detail = result.stderr.strip()[-500:] if code else ''
+                except subprocess.TimeoutExpired:
+                    code, detail = 124, 'Accounting check timed out; journal retained'
+                except Exception as e:
+                    code, detail = 1, str(e)[:500]
+                finished = time.time()
+                previous = self.heartbeat() or {}
+                heartbeat = dict(version=VERSION, started=started, finished=finished,
+                                 duration=round(finished-started, 2), exit_code=code,
+                                 last_success=finished if code == 0 else previous.get('last_success'),
+                                 error=detail)
+                atomic(self.p.heartbeat, json.dumps(heartbeat, indent=2))
+                print(datetime.now().astimezone().isoformat(timespec='seconds'),
+                      'RUN_OK' if code == 0 else 'RUN_FAILED', 'exit='+str(code))
+                return code
+        except BlockingIOError:
+            print('Another accounting/management operation is running; this check was skipped.')
+            return 0
+
+    def status(self, as_json=False):
+        state = validated_state(self.p.state) if self.p.state.exists() else None
+        heartbeat = self.heartbeat()
+        tracked = len(state['vms']) if state else 0
+        held = sum(bool(s['hold']) for s in state['vms'].values()) if state else 0
+        pending = sum(bool(s['pending']) for s in state['vms'].values()) if state else 0
+        last = heartbeat.get('last_success') if heartbeat else (
+            self.p.state.stat().st_mtime if state else None)
+        report = dict(version=self.installed_version(), available_version=VERSION,
+                      installed=self.installed(), enabled=self.enabled(), tracked=tracked,
+                      held=held, pending=pending, last_success=last,
+                      stale=bool(self.enabled() and (last is None or time.time()-last > 180)),
+                      last_run=heartbeat, state_path=str(self.p.state), vms=state['vms'] if state else {})
+        if as_json:
+            print(json.dumps(report, indent=2))
+            return report
+        print('KVM Bandwidth Carryover | installed:', report['version'])
+        print('Automatic checks:', 'ENABLED / every minute' if report['enabled'] else 'PAUSED / not configured')
+        print('VPS: %d tracked | %d need review | %d pending' % (tracked, held, pending))
+        print('Last successful check:', datetime.fromtimestamp(last).astimezone().isoformat(timespec='seconds') if last else 'not yet recorded')
+        if heartbeat and heartbeat.get('metadata_error'):
+            print('ATTENTION:', heartbeat['metadata_error'])
+        if report['stale']:
+            print('ATTENTION: no successful check in the last 3 minutes. Run: kvm-bw doctor')
+        if state:
+            print('VPS_ID    LIMIT_GB     USED_GB     LEFT_GB  STATUS')
+            for key, s in sorted(state['vms'].items(), key=lambda pair: int(pair[0])):
+                print('%-8s %10.2f %11.2f %11.2f  %s' %
+                      (key, s['limit']/100, s['used']/100,
+                       max(0, s['limit']-s['used']+s['reserve'])/100,
+                       s['hold'] or ('pending' if s['pending'] else 'tracking')))
+        return report
+
+    def logs(self, lines=30):
+        if not self.p.log.exists():
+            print('No application log yet.')
+            return
+        with self.p.log.open(errors='replace') as file:
+            print(''.join(deque(file, maxlen=min(500, max(1, lines)))), end='')
+
+    def preview(self):
+        with self.locked():
+            state = validated_state(self.p.state)
+            spec = importlib.util.spec_from_file_location('_kvm_bw_preview_core', self.p.app/'reset_carryover.py')
+            core = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(core)
+            core.BRIDGE, core.PHP = str(self.p.app/'bridge.php'), str(self.p.php)
+            snapshot = core.Bridge().snapshot()
+            print('PREVIEW ONLY: no accounting state or quotas will be changed.')
+            for vm in snapshot['vms']:
+                key = str(vm['id'])
+                old = state['vms'].get(key)
+                if old and old['pending']:
+                    print('VPS', key, 'pending correction; inspect status')
+                    continue
+                event, fresh, job = core.decide(old, vm, snapshot['now'], state['policy'])
+                print('VPS', key, ('quota %s -> %s GB' % (vm['limit'], job['target'])) if job else event,
+                      fresh['hold'] or '')
+
+    def resync(self, key):
+        with self.locked():
+            with self.locked_core_only():
+                validated_state(self.p.state)
+                backup = self._backup()
+            result = self.core_command('resync', str(int(key)))
+            print(result.stdout, end='')
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip() or 'Resync failed')
+            print('Previous baseline backup:', backup)
+
+    @contextmanager
+    def locked_core_only(self):
+        with (self.p.data/'lock').open('a') as file:
+            if os.name != 'nt':
+                import fcntl
+                fcntl.flock(file, fcntl.LOCK_EX)
+            yield
+
+    def policy(self, value):
+        with self.locked(core=True):
+            state = validated_state(self.p.state)
+            backup = self._backup()
+            state['policy'] = value
+            atomic(self.p.state, json.dumps(state, indent=2))
+        print('Under-1GB policy:', value, '| backup:', backup)
+
+    def doctor(self):
+        checks = []
+        def check(label, good, detail=''):
+            checks.append(bool(good))
+            print(('PASS' if good else 'FAIL')+' '+label+(' | '+detail if detail else ''))
+        check('Python >= 3.9', sys.version_info >= (3, 9), sys.version.split()[0])
+        for file in (self.p.php, self.p.sdk, self.p.universal, self.p.app/'bridge.php'):
+            check('Required file '+file.name, file.is_file())
+        try:
+            state = validated_state(self.p.state)
+            check('Accounting data readable', True, '%d VPS' % len(state['vms']))
+            check('No held or pending corrections', not any(s['hold'] or s['pending'] for s in state['vms'].values()))
+        except Exception as e:
+            check('Accounting data readable', False, str(e))
+        active = subprocess.run(['systemctl', 'is-active', '--quiet', 'crond'], capture_output=True).returncode == 0
+        if self.enabled():
+            check('Cron service active', active)
+            check('Cron uses managed scheduled-run command', 'scheduled-run' in self.p.cron.read_text())
+        else:
+            print('INFO Automatic checks are paused / not configured.')
+        heartbeat = self.heartbeat()
+        if heartbeat:
+            check('Run metadata readable', not heartbeat.get('metadata_error'))
+            if heartbeat.get('exit_code') is not None:
+                check('Last accounting check succeeded', heartbeat['exit_code'] == 0)
+        try:
+            result = subprocess.run([str(self.p.php), str(self.p.app/'bridge.php'), 'snapshot'],
+                                    capture_output=True, text=True, timeout=45)
+            snapshot = json.loads(result.stdout) if result.returncode == 0 else None
+            check('Read-only Virtualizor API check', bool(snapshot and snapshot.get('vms')))
+        except Exception:
+            check('Read-only Virtualizor API check', False)
+        return 0 if all(checks) else 1
+
+    def uninstall(self):
+        if not self.installed() and not self.p.state.exists():
+            print('Not installed; no accounting data found. Nothing changed.')
+            return
+        self.guard_directories()
+        atomic(self.p.paused, 'Uninstalled; accounting history intentionally retained.\n')
+        with self.locked(core=True):
+            backup = self._backup()
+            owned = [self.p.cron, self.p.rotate, self.p.command, self.p.alias]
+            owned += [self.p.app/name for name in (*ASSETS, 'VERSION')]
+            for file in owned:
+                if file.is_symlink():
+                    raise RuntimeError('Refusing unexpected symlink during uninstall: '+str(file))
+                if file.is_file():
+                    file.unlink()
+            # Delete only our own bytecode files, never recurse over unrelated files.
+            cache = self.p.app/'__pycache__'
+            if cache.is_dir() and not cache.is_symlink():
+                stems = {Path(name).stem for name in ASSETS if name.endswith('.py')}
+                for file in cache.glob('*.pyc'):
+                    if file.name.split('.')[0] in stems and file.is_file() and not file.is_symlink():
+                        file.unlink()
+                if not any(cache.iterdir()):
+                    cache.rmdir()
+            if self.p.app.is_dir() and not any(self.p.app.iterdir()):
+                self.p.app.rmdir()
+        print('UNINSTALLED: program and its Cron removed.')
+        print('Panel quotas unchanged. Accounting data and logs retained.')
+        print('Data:', self.p.data, '| backup:', backup)
+
+    def remote_upgrade(self):
+        with urllib.request.urlopen(SOURCE_URL, timeout=30) as response:
+            payload = response.read(2_000_001)
+        if len(payload) > 2_000_000 or b'# KVM_BW_MANAGER_BOOTSTRAP_V2' not in payload[:500]:
+            raise RuntimeError('GitHub does not contain the new management installer yet. Upload the new package first.')
+        with tempfile.TemporaryDirectory(prefix='kvm-bw-upgrade-') as folder:
+            file = Path(folder)/'install.sh'
+            file.write_bytes(payload)
+            os.chmod(file, 0o700)
+            return subprocess.run(['bash', str(file), 'upgrade']).returncode
+
+    def menu(self):
+        with open('/dev/tty', 'r+') as tty:
+            def ask(prompt):
+                print(prompt, end='', flush=True)
+                return tty.readline().strip()
+            while True:
+                print('\nKVM Bandwidth Carryover v'+VERSION+' | installed: '+self.installed_version())
+                print('1) Install / Upgrade\n2) Status\n3) Preview changes (read-only)\n4) Run one check')
+                print('5) Enable automatic checks\n6) Pause automatic checks\n7) Logs\n8) Doctor')
+                print('9) Backup\n10) Commands\n11) Uninstall (keep accounting data)\n0) Exit')
+                choice = ask('Select: ')
+                try:
+                    if choice == '0':
+                        return 0
+                    actions = {'1': lambda: self.remote_upgrade() if self.source.resolve() == self.p.app.resolve() else self.install(),
+                               '2': self.status, '3': self.preview, '4': self.run, '5': self.enable,
+                               '6': self.pause, '7': self.logs, '8': self.doctor, '9': self.backup,
+                               '10': print_commands, '11': self.uninstall}
+                    if choice not in actions:
+                        print('Unknown choice.')
+                    else:
+                        actions[choice]()
+                except Exception as e:
+                    print('ERROR:', e)
+                if ask('\nEnter to continue, or q to exit: ').lower() == 'q':
+                    return 0
+
+
+def print_commands():
+    print('''kvm-bw                     Interactive menu
+kvm-bw status              Version, Cron, last check and VPS balances
+kvm-bw status --json       Machine-readable status
+kvm-bw preview             Preview quota corrections without writing
+kvm-bw run                 Process one accounting check now
+kvm-bw enable / start      Enable the one-minute Cron
+kvm-bw disable / stop      Pause Cron and wait for current check to finish
+kvm-bw logs --lines 50      Read recent application logs
+kvm-bw doctor              Read-only dependency/API/health checks
+kvm-bw backup              Back up ledger, application and job settings
+kvm-bw resync VPS_ID       Accept current panel state as the new baseline
+kvm-bw policy hold         Hold corrections when the balance is below 1GB
+kvm-bw policy minimum-1gb  Use a minimum finite quota of 1GB
+kvm-bw upgrade             Download a newer installer; preserve history
+kvm-bw uninstall           Remove program/Cron; keep data and panel quotas
+kvm-bw version             Print version
+The legacy reset-carryover command supports these same subcommands.''')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--version', action='version', version=VERSION)
+    parser.add_argument('--source', type=Path, default=Path(__file__).resolve().parent, help=argparse.SUPPRESS)
+    sub = parser.add_subparsers(dest='command')
+    for name in ('menu', 'commands', 'version', 'upgrade', 'uninstall', 'enable', 'disable', 'start', 'stop',
+                 'doctor', 'backup', 'preview', 'run', 'scheduled-run'):
+        sub.add_parser(name)
+    install = sub.add_parser('install')
+    install.add_argument('--policy', choices=['minimum-1gb', 'hold'])
+    status = sub.add_parser('status')
+    status.add_argument('--json', action='store_true')
+    logs = sub.add_parser('logs')
+    logs.add_argument('--lines', type=int, default=30)
+    resync = sub.add_parser('resync')
+    resync.add_argument('vps_id', type=int)
+    policy = sub.add_parser('policy')
+    policy.add_argument('value', choices=['minimum-1gb', 'hold'])
+    args = parser.parse_args()
+    command = args.command or 'menu'
+    if command == 'commands':
+        print_commands()
+        return 0
+    if command == 'version':
+        print(VERSION)
+        return 0
+    if os.name == 'nt' or os.geteuid() != 0:
+        parser.error('Run on the AlmaLinux host as root')
+    os.umask(0o077)
+    manager = Manager(source=args.source)
+    if command == 'menu':
+        try:
+            return manager.menu()
+        except OSError:
+            raise RuntimeError('No interactive terminal. Use install, upgrade, status, uninstall, or commands as an argument.')
+    if command == 'install':
+        manager.install(args.policy)
+    elif command == 'upgrade':
+        if manager.source.resolve() == manager.p.app.resolve():
+            return manager.remote_upgrade()
+        manager.install()
+    elif command == 'status':
+        manager.status(args.json)
+    elif command == 'logs':
+        manager.logs(args.lines)
+    elif command in ('disable', 'stop'):
+        manager.pause()
+    elif command in ('enable', 'start'):
+        manager.enable()
+    elif command == 'uninstall':
+        manager.uninstall()
+    elif command == 'backup':
+        manager.backup()
+    elif command == 'preview':
+        manager.preview()
+    elif command == 'resync':
+        manager.resync(args.vps_id)
+    elif command == 'policy':
+        manager.policy(args.value)
+    elif command == 'doctor':
+        return manager.doctor()
+    elif command in ('run', 'scheduled-run'):
+        return manager.run(command == 'scheduled-run')
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print('\nCancelled. Accounting data retained.', file=sys.stderr)
+        sys.exit(130)
+    except Exception as error:
+        print('ERROR:', error, file=sys.stderr)
+        sys.exit(1)
+
+RC_MANAGER
+cat > "$stage_dir/test_reset_carryover.py" <<'RC_CORE_TEST'
 import copy
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 import reset_carryover as r
 
 
@@ -384,6 +970,9 @@ class FakeBridge:
 
 class ResetTests(unittest.TestCase):
     def setUp(self):
+        quiet = patch.object(r, 'log')
+        quiet.start()
+        self.addCleanup(quiet.stop)
         self.vm = dict(id='101', name='demo-vm', uuid='known', limit='5000', used='4300')
         self.old = r.baseline(self.vm, 100)
         self.new = dict(self.vm, used='0')
@@ -562,45 +1151,314 @@ class ResetTests(unittest.TestCase):
 if __name__ == '__main__':
     unittest.main()
 
-RC_TESTS
-chmod 0600 /opt/reset-carryover/reset_carryover.py /opt/reset-carryover/test_reset_carryover.py /opt/reset-carryover/bridge.php
-/usr/local/emps/bin/php -l /opt/reset-carryover/bridge.php
-/usr/bin/python3 -m py_compile /opt/reset-carryover/reset_carryover.py
-echo 'Running isolated tests (no panel writes).'
-(cd /opt/reset-carryover && /usr/bin/python3 -m unittest -q test_reset_carryover)
-cat > /usr/local/sbin/reset-carryover <<'RC_WRAPPER'
-#!/usr/bin/env bash
-set -euo pipefail
-umask 077
-if [[ $EUID -ne 0 ]]; then echo 'Run as root.' >&2; exit 1; fi
-if [[ $# -eq 0 ]]; then set -- status; fi
-exec /usr/bin/python3 /opt/reset-carryover/reset_carryover.py "$@"
-RC_WRAPPER
-chmod 0700 /usr/local/sbin/reset-carryover
-/usr/local/sbin/reset-carryover init "$policy"
-install -m 0600 /dev/null /var/log/reset-carryover.log
-cat > /etc/cron.d/reset-carryover <<'RC_CRON'
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-* * * * * root timeout 55s /usr/local/sbin/reset-carryover run >> /var/log/reset-carryover.log 2>&1
-RC_CRON
-chmod 0644 /etc/cron.d/reset-carryover
-if [[ -d /etc/logrotate.d ]]; then
-cat > /etc/logrotate.d/reset-carryover <<'RC_ROTATE'
-/var/log/reset-carryover.log {
-    size 5M
-    rotate 7
-    compress
-    missingok
-    notifempty
-    create 0600 root root
-}
-RC_ROTATE
-chmod 0644 /etc/logrotate.d/reset-carryover
-fi
-echo 'INSTALLED: every observed decrease in usage will be treated as a reset.'
-echo 'Cron runs every minute. Only bandwidth quota is edited.'
-echo "Under-1GB policy: $policy. Zero is never written as a depleted quota."
-echo 'Status: reset-carryover status'
-echo 'Log: tail -n 30 /var/log/reset-carryover.log'
-echo 'Backup: reset-carryover backup'
+RC_CORE_TEST
+cat > "$stage_dir/test_carryover_manager.py" <<'RC_MANAGER_TEST'
+import contextlib
+import io
+import json
+from pathlib import Path
+import subprocess
+import tarfile
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import carryover_manager as m
+
+
+def state():
+    return dict(version=2, policy='minimum-1gb', vms={
+        '101': dict(name='demo-vm', uuid='known', limit=500000, used=430000,
+                    at=123, reserve=52, hold=None, pending=None, resets=3)})
+
+
+class TestManager(m.Manager):
+    __test__ = False
+
+    def preflight(self):
+        pass
+
+    def validate_source(self):
+        pass
+
+    def initialize_unlocked(self, policy):
+        self.initialized += 1
+        s = state()
+        s['policy'] = policy
+        m.atomic(self.p.state, json.dumps(s))
+
+    def core_command(self, *args):
+        self.calls.append(args)
+        return subprocess.CompletedProcess(args, self.core_result, stdout='', stderr='')
+
+
+class ManagementTests(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.root = Path(self.folder.name)
+        self.paths = m.Paths(self.root/'host')
+        self.source = self.root/'source'
+        self.source.mkdir()
+        for name in m.ASSETS:
+            (self.source/name).write_text('# fixture '+name+'\n')
+        self.manager = TestManager(self.paths, self.source)
+        self.manager.initialized = 0
+        self.manager.calls = []
+        self.manager.core_result = 0
+        self.output = io.StringIO()
+        quiet = contextlib.redirect_stdout(self.output)
+        quiet.__enter__()
+        self.addCleanup(quiet.__exit__, None, None, None)
+
+    def install(self):
+        self.manager.install()
+
+    def test_fresh_install_initializes_once_and_adds_managed_cron(self):
+        self.install()
+        self.assertEqual(self.manager.initialized, 1)
+        self.assertTrue(self.manager.enabled())
+        self.assertIn('scheduled-run', self.paths.cron.read_text())
+        self.assertTrue(self.paths.alias.exists())
+        self.assertEqual(self.manager.installed_version(), m.VERSION)
+
+    def test_upgrade_preserves_ledger_bytes_and_pending_correction(self):
+        self.install()
+        s = state()
+        s['vms']['101']['pending'] = {'target': 700, 'expected': 500000}
+        m.atomic(self.paths.state, json.dumps(s, indent=4))
+        original = self.paths.state.read_bytes()
+        (self.source/'reset_carryover.py').write_text('# newer core')
+        self.manager.install()
+        self.assertEqual(self.paths.state.read_bytes(), original)
+        self.assertEqual(self.manager.initialized, 1)
+        self.assertTrue(list((self.paths.data/'backups').glob('*.tar.gz')))
+
+    def test_upgrade_keeps_paused_schedule_paused(self):
+        self.install()
+        self.manager.pause()
+        self.manager.install()
+        self.assertFalse(self.manager.enabled())
+        self.assertFalse(self.paths.cron.exists())
+
+    def test_legacy_install_can_upgrade_without_reenrollment(self):
+        self.paths.app.mkdir(parents=True)
+        self.paths.data.mkdir(parents=True)
+        (self.paths.app/'reset_carryover.py').write_text('# legacy')
+        m.atomic(self.paths.state, json.dumps(state()))
+        m.atomic(self.paths.cron, '* * * * * root legacy-run\n')
+        before = self.paths.state.read_bytes()
+        self.manager.install()
+        self.assertEqual(self.manager.initialized, 0)
+        self.assertEqual(self.paths.state.read_bytes(), before)
+        self.assertTrue(self.manager.enabled())
+        self.assertIn('scheduled-run', self.paths.cron.read_text())
+
+    def test_invalid_saved_state_is_not_reinitialized(self):
+        self.paths.data.mkdir(parents=True)
+        self.paths.state.write_text('{broken')
+        with self.assertRaises(ValueError):
+            self.manager.install()
+        self.assertEqual(self.paths.state.read_text(), '{broken')
+        self.assertEqual(self.manager.initialized, 0)
+
+    def test_enable_disable_do_not_edit_accounting_state(self):
+        self.install()
+        original = self.paths.state.read_bytes()
+        self.manager.pause()
+        self.assertFalse(self.manager.enabled())
+        self.manager.enable()
+        self.assertTrue(self.manager.enabled())
+        self.assertEqual(self.paths.state.read_bytes(), original)
+        self.assertEqual(self.manager.calls, [])
+
+    def test_uninstall_removes_program_but_preserves_state_log_and_other_files(self):
+        self.install()
+        original = self.paths.state.read_bytes()
+        self.paths.log.write_text('audit history')
+        unrelated = self.paths.app/'unrelated.txt'
+        unrelated.write_text('keep')
+        virtualizor = self.paths.root/'etc/cron.d/virtualizor'
+        virtualizor.write_text('original panel cron')
+        self.manager.uninstall()
+        self.assertFalse(self.paths.command.exists())
+        self.assertFalse(self.paths.alias.exists())
+        self.assertFalse(self.paths.cron.exists())
+        self.assertFalse(self.manager.installed())
+        self.assertEqual(self.paths.state.read_bytes(), original)
+        self.assertEqual(self.paths.log.read_text(), 'audit history')
+        self.assertEqual(unrelated.read_text(), 'keep')
+        self.assertEqual(virtualizor.read_text(), 'original panel cron')
+        self.assertEqual(self.manager.calls, [])
+
+    def test_reinstall_after_uninstall_preserves_history(self):
+        self.install()
+        original = self.paths.state.read_bytes()
+        self.manager.uninstall()
+        self.manager.install()
+        self.assertEqual(self.paths.state.read_bytes(), original)
+        self.assertEqual(self.manager.initialized, 1)
+        self.assertTrue(self.manager.enabled())
+
+    def test_backup_contains_ledger_and_excludes_backups_and_credentials(self):
+        self.install()
+        path = self.manager.backup()
+        with tarfile.open(path) as archive:
+            names = archive.getnames()
+            self.assertIn('data/state.json', names)
+            self.assertFalse(any('universal.php' in n or 'backups/' in n for n in names))
+
+    def test_scheduled_check_is_skipped_when_paused(self):
+        self.install()
+        self.manager.pause()
+        self.assertEqual(self.manager.run(scheduled=True), 0)
+        self.assertEqual(self.manager.calls, [])
+        self.assertFalse(self.paths.heartbeat.exists())
+
+    def test_explicit_run_works_while_schedule_is_paused(self):
+        self.install()
+        self.manager.pause()
+        self.assertEqual(self.manager.run(), 0)
+        self.assertEqual(self.manager.calls, [('run',)])
+        self.assertEqual(json.loads(self.paths.heartbeat.read_text())['exit_code'], 0)
+
+    def test_failed_check_records_heartbeat_and_keeps_last_success(self):
+        self.install()
+        self.manager.run()
+        success = json.loads(self.paths.heartbeat.read_text())['last_success']
+        self.manager.core_result = 1
+        self.assertEqual(self.manager.run(), 1)
+        h = json.loads(self.paths.heartbeat.read_text())
+        self.assertEqual(h['exit_code'], 1)
+        self.assertEqual(h['last_success'], success)
+
+    def test_corrupt_optional_heartbeat_does_not_stop_accounting(self):
+        self.install()
+        self.paths.heartbeat.write_text('{broken')
+        self.assertEqual(self.manager.run(), 0)
+        self.assertEqual(json.loads(self.paths.heartbeat.read_text())['exit_code'], 0)
+
+    def test_status_json_reports_held_and_pending_records(self):
+        self.install()
+        s = state()
+        s['vms']['101'].update(hold='review', pending={'target': 700})
+        m.atomic(self.paths.state, json.dumps(s))
+        capture = io.StringIO()
+        with contextlib.redirect_stdout(capture):
+            report = self.manager.status(as_json=True)
+        self.assertEqual(json.loads(capture.getvalue())['held'], 1)
+        self.assertEqual(report['pending'], 1)
+
+    def test_first_failed_run_is_reported_as_stale(self):
+        self.install()
+        self.manager.core_result = 1
+        self.manager.run()
+        self.assertTrue(self.manager.status()['stale'])
+
+    def test_policy_change_does_not_reset_balances(self):
+        self.install()
+        before = json.loads(self.paths.state.read_text())['vms']
+        self.manager.policy('hold')
+        after = json.loads(self.paths.state.read_text())
+        self.assertEqual(after['policy'], 'hold')
+        self.assertEqual(after['vms'], before)
+
+    def test_logs_limit_is_bounded(self):
+        self.install()
+        self.paths.log.write_text(''.join(str(i)+'\n' for i in range(1000)))
+        capture = io.StringIO()
+        with contextlib.redirect_stdout(capture):
+            self.manager.logs(50000)
+        self.assertEqual(len(capture.getvalue().splitlines()), 500)
+
+    def test_upgrade_failure_rolls_back_program_and_keeps_data(self):
+        self.install()
+        before_core = (self.paths.app/'reset_carryover.py').read_bytes()
+        before_state = self.paths.state.read_bytes()
+        before_cron = self.paths.cron.read_bytes()
+        (self.source/'reset_carryover.py').write_text('# changed')
+        with patch.object(self.manager, '_schedule', side_effect=RuntimeError('simulate install failure')):
+            with self.assertRaises(RuntimeError):
+                self.manager.install()
+        self.assertEqual((self.paths.app/'reset_carryover.py').read_bytes(), before_core)
+        self.assertEqual(self.paths.state.read_bytes(), before_state)
+        self.assertEqual(self.paths.cron.read_bytes(), before_cron)
+
+    def test_old_remote_installer_is_not_executed_as_an_upgrade(self):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self, size): return b'#!/bin/bash\necho legacy\n'
+        with patch.object(m.urllib.request, 'urlopen', return_value=Response()):
+            with patch.object(m.subprocess, 'run') as execute:
+                with self.assertRaises(RuntimeError):
+                    self.manager.remote_upgrade()
+                execute.assert_not_called()
+
+    def test_actual_source_validation_failure_stops_before_install(self):
+        manager = m.Manager(self.paths, self.source)
+        self.source.joinpath('reset_carryover.py').write_text('def broken(')
+        with self.assertRaises(SyntaxError):
+            manager.validate_source()
+        self.assertFalse(self.paths.command.exists())
+
+    def test_status_remains_readable_with_corrupt_optional_metadata(self):
+        self.install()
+        before = self.paths.state.read_bytes()
+        self.paths.heartbeat.write_text('{broken')
+        report = self.manager.status()
+        self.assertTrue(report['last_run']['metadata_error'])
+        self.assertEqual(self.paths.state.read_bytes(), before)
+
+    def test_upgrade_does_not_silently_change_requested_policy(self):
+        self.install()
+        before = self.paths.state.read_bytes()
+        with self.assertRaises(RuntimeError):
+            self.manager.install('hold')
+        self.assertEqual(self.paths.state.read_bytes(), before)
+
+    def test_resync_backup_contains_state_before_operator_override(self):
+        self.install()
+        before = self.paths.state.read_bytes()
+        def override(*args):
+            modified = state()
+            modified['vms']['101']['used'] = 0
+            m.atomic(self.paths.state, json.dumps(modified))
+            return subprocess.CompletedProcess(args, 0, stdout='', stderr='')
+        with patch.object(self.manager, 'core_command', side_effect=override):
+            self.manager.resync(101)
+        archives = list((self.paths.data/'backups').glob('*.tar.gz'))
+        with tarfile.open(archives[-1]) as archive:
+            self.assertEqual(archive.extractfile('data/state.json').read(), before)
+        self.assertEqual(json.loads(self.paths.state.read_text())['vms']['101']['used'], 0)
+
+    def test_doctor_is_read_only_and_intentional_pause_is_not_an_error(self):
+        self.install()
+        self.manager.pause()
+        for file in (self.paths.php, self.paths.sdk, self.paths.universal):
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text('fixture')
+        before = self.paths.state.read_bytes()
+        calls = []
+        def result(args, **kwargs):
+            calls.append(args)
+            if args[0] == 'systemctl':
+                return subprocess.CompletedProcess(args, 0, stdout='', stderr='')
+            return subprocess.CompletedProcess(args, 0, stdout='{"vms":[{"id":"101"}]}', stderr='')
+        with patch.object(m.subprocess, 'run', side_effect=result):
+            self.assertEqual(self.manager.doctor(), 0)
+        self.assertEqual(self.paths.state.read_bytes(), before)
+        self.assertFalse(any('write' in call for call in calls))
+
+    def test_uninstall_before_install_does_not_create_or_delete_data(self):
+        self.manager.uninstall()
+        self.assertFalse(self.paths.data.exists())
+        self.assertFalse(self.paths.app.exists())
+        self.assertEqual(self.manager.calls, [])
+
+
+if __name__ == '__main__':
+    unittest.main()
+
+RC_MANAGER_TEST
+PYTHONDONTWRITEBYTECODE=1 python3 "$stage_dir/carryover_manager.py" --source "$stage_dir" "$@"
