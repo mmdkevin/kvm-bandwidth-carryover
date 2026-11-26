@@ -1,8 +1,8 @@
 # KVM Bandwidth Carryover
 
-<p dir="rtl">مدیریت حجم باقی‌ماندهٔ مشتریان در <strong>Virtualizor KVM</strong>، بدون شارژ دوبارهٔ سهمیه پس از ریست مصرف.</p>
+<p dir="rtl">این اسکریپت به شکل اتوماتیک در <strong>Virtualizor KVM</strong> زمانی که ریست دوره ای انجام میشود سقف ترافیک را به حجم باقی مانده هر VPS تبدیل می کند.</p>
 
-Keep customers' remaining traffic allowance after usage resets in **Virtualizor KVM**.
+This script automatically sets each VPS's traffic quota to its remaining allowance when a periodic usage reset occurs in **Virtualizor KVM**.
 
 [فارسی](#persian) | [English](#english)
 
@@ -16,7 +16,7 @@ Keep customers' remaining traffic allowance after usage resets in **Virtualizor 
 
 ### این اسکریپت چه مشکلی را حل می‌کند؟
 
-اگر VPS را با حجم مشخص می‌فروشید، ریست دوره‌ای مصرف در Virtualizor می‌تواند دوباره کل سهمیه را در اختیار مشتری بگذارد. این اسکریپت بعد از تشخیص ریست، **سقف ترافیک را به حجم باقی‌ماندهٔ مشتری تغییر می‌دهد**.
+اگر VPS را با حجم مشخصی تعریف کرده اید، ریست دوره‌ای مصرف در Virtualizor می‌تواند دوباره کل ترافیک را در اختیار مشتری بگذارد. این اسکریپت بعد از تشخیص ریست، **سقف ترافیک را به حجم باقی مانده هر VPS تغییر می‌دهد**.
 
 مثلاً مشتری از **۵۰۰۰ گیگ، ۴۳۰۰ گیگ** مصرف کرده است:
 
@@ -39,15 +39,15 @@ bash <(curl -fsSL https://raw.githubusercontent.com/mmdkevin/kvm-bandwidth-carry
 
 </div>
 
-در شروع، حجم و مصرف فعلی ثبت می‌شود؛ بررسی خودکار **هر دقیقه** ادامه پیدا می‌کند، حتی بعد از بستن SSH. برای بازکردن منوی مدیریت بنویسید **`kvm-bw`**؛ مشاهدهٔ وضعیت، گزارش‌ها، توقف بررسی‌ها و حذف برنامه از همان منو انجام می‌شود.
+در ابتدا، حجم و مصرف فعلی VPS ها ثبت می‌شود؛ بررسی خودکار **هر 1 دقیقه** است، حتی بعد از بستن SSH. برای بازکردن منوی مدیریت بنویسید `kvm-bw`؛ مشاهدهٔ وضعیت، گزارش‌ها، توقف بررسی‌ها و حذف کامل اسکریپت از همان منو انجام می‌شود.
 
-محیط‌های هدف: **AlmaLinux 9 و Ubuntu 22.04 / 24.04**، برای VPSهای KVM روی همان سرور اصلی؛ نودهای Slave پوشش داده نمی‌شوند. اجرای کامل روی میزبان واقعی Ubuntu هنوز آزمایش نشده است.
+محیط‌های هدف: **AlmaLinux 9 و Ubuntu 22.04 / 24.04**
 
 ### قبل از استفاده بدانید
 
-- **برای شارژ مشتری، فیلد Bandwidth را افزایش دهید؛ مصرف را دستی ریست نکنید.** اسکریپت هر کاهش مصرف را ریست حساب می‌کند.
-- VPSهای جدید با سهمیهٔ محدود، خودکار به بررسی‌ها اضافه می‌شوند.
-- اسکریپت فقط سقف ترافیک را تغییر می‌دهد؛ قطع یا تعلیق VPS به تنظیمات خود Virtualizor بستگی دارد. حداقل سقف پیش‌فرض یک گیگ است، پس قطع دقیق در اعتبار صفر ندارد.
+- **برای تغییرات ترافیک فیلد Bandwidth را افزایش یا کاهش دهید؛ مصرف را دستی ریست نکنید.** اسکریپت هر کاهش مصرف را ریست دوره ای حساب می‌کند.
+- اگر VPS جدید با ترافیک محدود ساخته شود، خودکار به لیست بررسی‌ها اضافه می شود.
+- اسکریپت فقط سقف ترافیک را تغییر می‌دهد؛ قطع یا تعلیق VPS به تنظیمات خود Virtualizor بستگی دارد.
 - دقت محاسبه به آمار پنل و فاصلهٔ بررسی‌ها وابسته است؛ بعضی ریست‌ها یا مصرف‌ها ممکن است دیده نشوند. مصرف ریست‌شدهٔ قبل از نصب بازیابی نمی‌شود.
 
 <details>
@@ -70,7 +70,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/mmdkevin/kvm-bandwidth-carry
 
 ### What problem does it solve?
 
-When you sell a VPS with a fixed traffic allowance, a periodic Virtualizor usage reset can give the customer the full allowance again. This tool detects the reset and **replaces the quota with the customer's remaining traffic allowance**.
+When you configure a VPS with a fixed traffic allowance, a periodic Virtualizor usage reset can give the customer the full allowance again. This script detects the reset and **sets each VPS's traffic quota to its remaining allowance**.
 
 For example, a customer has used **4,300 GB of 5,000 GB**:
 
@@ -89,15 +89,15 @@ Run as `root` on the **main Virtualizor host**, then choose **1 — Install / Up
 bash <(curl -fsSL https://raw.githubusercontent.com/mmdkevin/kvm-bandwidth-carryover/main/install.sh)
 ```
 
-The tool starts by recording current usage and quotas, then checks **every minute**, even after SSH closes. Run **`kvm-bw`** to open the menu for status, logs, pausing checks, and removal.
+The script first records current VPS usage and quotas, then checks automatically **every 1 minute**, even after SSH closes. Run `kvm-bw` to open the menu for status, logs, pausing checks, and complete script removal.
 
-Target systems: **AlmaLinux 9 and Ubuntu 22.04 / 24.04**, managing KVM guests on the same main host. Slave nodes are not covered. A full installation on a real Ubuntu Virtualizor host has not yet been tested.
+Target systems: **AlmaLinux 9 and Ubuntu 22.04 / 24.04**
 
 ### Before you use it
 
-- **Add traffic by increasing Bandwidth; do not manually reset usage.** Every observed decrease in usage counts as a reset.
-- New VPSs with finite quotas are automatically included in future checks.
-- The tool only changes traffic quotas. Suspension and traffic enforcement depend on Virtualizor settings. The default minimum quota is 1 GB, so this is not a strict zero-credit cutoff.
+- **Adjust traffic by increasing or decreasing Bandwidth; do not manually reset usage.** The script treats every observed decrease in usage as a periodic reset.
+- If a new VPS is created with a finite traffic allowance, it is automatically included in checks.
+- The script only changes traffic quotas. VPS disconnection or suspension depends on Virtualizor settings.
 - Accuracy depends on panel statistics and the check interval; some resets or consumption may be missed. Usage reset before installation cannot be recovered.
 
 <details>
